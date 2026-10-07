@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -18,6 +19,12 @@ SYSTEM_PROMPT = """Ты полезный персональный помощни
 Не заканчивай каждый ответ вопросом. Не изображай человека и не придумывай свои чувства,
 воспоминания или события жизни. На прямой вопрос честно скажи, что ты ИИ.
 Следи за контекстом: «да», «это», «ещё», «продолжай» относятся к текущему обсуждению.
+Последняя реплика определяет текущую задачу. Жалоба, исправление или новая тема прерывает старую:
+не продолжай стих, рассказ или прежнее поручение, если человек уже спрашивает о звонке или формате.
+Раздражение и ругань не отменяют смысл просьбы. Ответь спокойно и кратко, без нравоучений,
+насмешек, заискивания и неуместных стихов. Если ошибся, признай конкретную ошибку и исправь её.
+На вопрос про непринятый звонок используй факты журнала. Не отвечай «у меня нет телефона»:
+приём звонков обеспечивает приложение. Если причины нет в журнале, честно скажи, что она неизвестна.
 Используй известные сведения естественно: «Тебя зовут Анна», без вступления о записях и
 постоянных инструкций по памяти. Команды памяти объясняй только по запросу или если
 нужна конкретная проверка неподтверждённого факта. Не проси подтверждать активные сведения.
@@ -73,6 +80,12 @@ class ProviderError(Exception):
 
 
 class Provider:
+    def matches_model(self, reported):
+        # A6 currently labels responses to the public Flash ID with its -n backend ID.
+        return reported == self.settings.model or (
+            self.settings.model == "gemini-3.8-flash" and reported == "gemini-3.8-flash-n"
+        )
+
     def __init__(self, settings, client=None, metrics=None):
         self.settings = settings
         self.metrics = metrics
@@ -89,6 +102,10 @@ class Provider:
         track = self.metrics is not None and path == "/chat/completions"
         try:
             data = await self._request(method, path, **kwargs)
+        except asyncio.CancelledError:
+            if track:
+                self.metrics.record(usage_kind, ok=False, model=self.settings.model)
+            raise
         except ProviderError:
             if track:
                 self.metrics.record(usage_kind, ok=False, model=self.settings.model)
@@ -131,7 +148,7 @@ class Provider:
         except (KeyError, TypeError):
             raise ProviderError("Провайдер вернул некорректный список моделей.")
 
-    async def step(self, messages, tools, *, usage_kind="model"):
+    async def step(self, messages, tools, *, usage_kind="model", max_tokens=6000):
         now = datetime.now(timezone(timedelta(hours=5))).isoformat(timespec="minutes")
         data = await self.request(
             "POST",
@@ -149,11 +166,12 @@ class Provider:
                 ],
                 "tools": tools,
                 "tool_choice": "auto",
-                "max_tokens": 6000,
+                "max_tokens": max_tokens,
+                "stream": False,
             },
         )
         try:
-            if data.get("model") != self.settings.model:
+            if not self.matches_model(data.get("model")):
                 raise ProviderError("Провайдер вернул другой ID модели; ответ отклонён.")
             choice = data["choices"][0]
             message = choice["message"]
@@ -186,11 +204,12 @@ class Provider:
                 "model": self.settings.model,
                 "messages": [{"role": "system", "content": system_prompt}, *messages],
                 "max_tokens": max_tokens,
+                "stream": False,
             },
         )
         try:
             reported_model = data.get("model")
-            if reported_model != self.settings.model:
+            if not self.matches_model(reported_model):
                 raise ProviderError("Провайдер вернул другой или пустой ID модели; ответ отклонён.")
             choice = data["choices"][0]
             content = choice["message"]["content"]

@@ -3,6 +3,7 @@
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 
 def number(value):
@@ -55,19 +56,37 @@ class Metrics:
         prompt, output, cached, written = tokens
         cost, complete = None, False
         estimate = None
-        if kind in {"model", "summary", "background", "memory"} and model == "claude-sonnet-5-5":
+        if kind in {
+            "model",
+            "summary",
+            "background",
+            "memory",
+            "call",
+            "perception",
+            "transcription",
+        } and model in {"claude-sonnet-5-5", "gemini-3.8-flash"}:
+            rates = (
+                (Decimal("360"), Decimal("1800"), Decimal("36"), Decimal("450"))
+                if model == "claude-sonnet-5-5"
+                else (Decimal("16.1"), Decimal("80.4"), Decimal("1.6"), Decimal("0"))
+            )
+            rate_in, rate_out, rate_read, rate_write = rates
             # USD per million: input .36, output 1.8, cache read .036, write .45.
             # Integer nanodollars avoid floating-point rounding of tiny charges.
-            cost = output * 1800 if output is not None else 0
+            cost = output * rate_out if output is not None else 0
             if prompt is not None and output is not None:
                 estimate = (
                     cost
-                    + max(0, prompt - (cached or 0) - (written or 0)) * 360
-                    + (cached or 0) * 36
-                    + (written or 0) * 450
+                    + max(0, prompt - (cached or 0) - (written or 0)) * rate_in
+                    + (cached or 0) * rate_read
+                    + (written or 0) * rate_write
                 )
             if all(v is not None for v in (prompt, cached, written)) and cached + written <= prompt:
-                cost += (prompt - cached - written) * 360 + cached * 36 + written * 450
+                cost += (
+                    (prompt - cached - written) * rate_in
+                    + cached * rate_read
+                    + written * rate_write
+                )
                 complete = output is not None
         elif kind == "image" and ok:
             cost, complete = amount * 1_200_000, True
@@ -84,9 +103,9 @@ class Metrics:
                     *tokens,
                     input_chars,
                     output_chars,
-                    cost,
+                    int(round(cost)) if cost is not None else None,
                     int(complete),
-                    estimate,
+                    int(round(estimate)) if estimate is not None else None,
                 ),
             )
 
@@ -108,7 +127,7 @@ class Metrics:
             count(output_tokens) AS output_known, sum(output_tokens) AS output_tokens,
             count(cached_tokens) AS cached_known, sum(cached_tokens) AS cached_tokens,
             count(cache_write_tokens) AS written_known, sum(cache_write_tokens) AS written_tokens
-            FROM events WHERE created>=? AND kind IN ('model','summary','background','memory')""",
+            FROM events WHERE created>=? AND kind IN ('model','summary','background','memory','call','perception','transcription')""",
             (since,),
         ).fetchone()
 
@@ -133,7 +152,7 @@ class Metrics:
         cost_rows = self.db.execute(
             """SELECT kind,coalesce(sum(cost_nano),0) AS cost,
             sum(CASE WHEN cost_complete=1 THEN 0 ELSE 1 END) AS unknown
-            FROM events WHERE created>=? AND kind IN ('model','summary','background','memory','image','voice')
+            FROM events WHERE created>=? AND kind IN ('model','summary','background','memory','call','perception','transcription','image','voice')
             GROUP BY kind""",
             (since,),
         ).fetchall()
@@ -142,7 +161,26 @@ class Metrics:
         estimate = self.db.execute(
             "SELECT coalesce(sum(estimate_nano),0) FROM events WHERE created>=?", (since,)
         ).fetchone()[0]
-        model_cost = sum(costs.get(k, 0) for k in ("model", "summary", "background", "memory"))
+        model_cost = sum(
+            costs.get(k, 0)
+            for k in (
+                "model",
+                "summary",
+                "background",
+                "memory",
+                "call",
+                "perception",
+                "transcription",
+            )
+        )
+        model_rows = self.db.execute(
+            "SELECT model,count(*),coalesce(sum(cost_nano),0),coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(cached_tokens),0) FROM events WHERE created>=? AND kind IN ('model','summary','background','memory','call','perception','transcription') GROUP BY model",
+            (since,),
+        ).fetchall()
+        per_model = "\n".join(
+            f"{r[0]}: {r[1]} запросов; вход {r[3]}, выход {r[4]}, кэш {r[5]}; известная стоимость ${r[2] / 1_000_000_000:.8f}"
+            for r in model_rows
+        )
         image_cost = costs.get("image", 0)
 
         def money(n):
@@ -165,13 +203,14 @@ class Metrics:
             f"Поисков выполнено: {count('search')}\n"
             f"Сжатий памяти сохранено: {count('compression')}\n"
             f"Ошибок учтённых API-запросов: {errors}\n\n"
-            f"Расход Claude (известная часть): {money(model_cost)}\n"
+            f"Расход моделей (известная часть): {money(model_cost)}\n{per_model}\n"
             f"Расход на изображения: {money(image_cost)}\n"
             f"Итого по известным данным: {money(model_cost + image_cost)}\n"
             f"Оценка с входными токенами: {money(estimate)}\n"
             "Для оценки отсутствующие данные чтения/записи кэша приняты за 0. Неизвестные токены и озвучка не включены.\n"
             f"Событий с неполной стоимостью: {unknown}\n\n"
             "Тарифы за 1 млн токенов: вход $0.36, выход $1.80, чтение кэша $0.036, запись $0.45.\n"
+            "Gemini Flash за 1 млн: вход $0.0161, выход $0.0804, чтение кэша $0.0016, запись $0.\n"
             "Изображение: $0.0012. Тариф озвучки не задан. Это расчёт, не счёт провайдера.\n"
             f"Учёт начат: {started}. Старые расходы не восстановлены.\n"
             "Токены взяты из ответа API. Кэш уже входит во входные токены."
@@ -193,7 +232,12 @@ def memory_report(history, settings):
     unconfirmed = db.execute(
         "SELECT count(*) FROM memory_facts WHERE status='unconfirmed'"
     ).fetchone()[0]
+    call_count, failed_calls, call_turns, interruptions, latency = db.execute(
+        "SELECT count(*),coalesce(sum(status IN ('missed','failed','declined')),0),coalesce(sum(turns),0),coalesce(sum(interruptions),0),coalesce(sum(latency_ms),0) FROM call_events"
+    ).fetchone()
     return (
+        f"Звонков: {call_count}; пропущено/сбои/отклонено: {failed_calls}; реплик: {call_turns}; перебиваний: {interruptions}.\n"
+        f"Среднее время подготовки ответа в звонке: {round(latency / call_turns / 1000, 1) if call_turns else 0} с (без синтеза).\n\n"
         f"Карточки: {facts} активных фактов, {conflicts} противоречивых записей.\n"
         f"Ожидают подтверждения из голосовых: {unconfirmed}.\n"
         f"Очередь разбора: {pending}; не разобрано после 3 попыток: {failed}.\n\n"

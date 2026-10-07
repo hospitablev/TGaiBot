@@ -41,6 +41,9 @@ def control_intent(text):
     normalized = text.strip().lower().strip(".!? ")
     normalized = re.sub(r"^пожалуйста[, ]+", "", normalized)
     normalized = re.sub(r"[, ]+пожалуйста$", "", normalized)
+    # Only a complete short format command; quoted text and new writing tasks stay with the agent.
+    if re.fullmatch(r"пиши(?: текстом)?(?:[, ]+(?:блин|бля|блядь|еблан|дурак|идиот))?", normalized):
+        return "/ai_voice_off"
     aliases = {
         "/memory_retry": {"обнови память", "повтори разбор памяти"},
         "/my_memory": {

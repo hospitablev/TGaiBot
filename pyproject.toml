@@ -34,7 +34,7 @@ tgaibot = "tgaibot.__main__:main"
 include = ["tgaibot*"]
 
 [tool.setuptools.package-data]
-tgaibot = ["web/*.html"]
+tgaibot = ["web/*.html", "assets/call-sounds/*/*.pcm"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -62,6 +62,8 @@ class Archive:
         self.db.close()
 
     def capture(self, chat_id, title, username, message):
+        if getattr(self, "call_journal", None):
+            self.call_journal.service(chat_id, message)
         file = getattr(message, "file", None)
         kind = next(
             (

@@ -89,6 +89,18 @@ async def test_background_plan_action_completion_and_notification(manager):
     assert manager.history.messages(10)
 
 
+async def test_voice_task_sends_file_without_negative_reply_id(manager):
+    task_id = create(manager, source=-123456789)
+    manager.agent.provider.step.side_effect = [
+        response("create_text_file", {"name": "call", "content": "Готово", "format": "txt"}),
+        finish(),
+    ]
+    await manager.run_task(10, task_id)
+    assert manager.store.get(10, task_id)["status"] == "completed"
+    manager.agent.client.send_file.assert_awaited_once()
+    assert manager.agent.client.send_file.call_args.kwargs.get("reply_to") is None
+
+
 async def test_task_creation_is_deduplicated_and_scoped(manager):
     task_id = create(manager)
     assert create(manager) == task_id

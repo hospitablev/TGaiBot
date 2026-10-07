@@ -267,6 +267,9 @@ class Memory:
         recalled = dict(retrieved)
         recalled.update(gap)
         blocks = []
+        call_context = self.history.calls.context(user_id)
+        if call_context:
+            blocks.append(call_context)
         withdrawn = self.history.knowledge.withdrawn(user_id)
         if withdrawn:
             blocks.append(

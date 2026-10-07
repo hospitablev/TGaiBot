@@ -37,10 +37,12 @@ class Settings:
     fish_key: str = field(default="", repr=False)
     fish_model: str = "s2.1-pro"
     fish_voice: str = ""
-    fish_speed: float = 1.0
+    fish_speed: float = 0.7
     voice_replies: str = "auto"
     enable_calls: bool = False
     call_users: frozenset[int] = frozenset()
+    call_usernames: tuple[str, ...] = ()
+    fast_model: str = "gemini-3.8-flash"
     telegram_session: str = field(default="", repr=False)
     tavily_key: str = field(default="", repr=False)
     archive_password: str = field(default="", repr=False)
@@ -99,7 +101,7 @@ class Settings:
         if voice_replies not in {"auto", "always", "off"}:
             raise ConfigError("VOICE_REPLIES: auto, always или off")
         try:
-            speed = float(os.getenv("FISH_SPEED", "1"))
+            speed = float(os.getenv("FISH_SPEED", "0.7"))
             if not 0.5 <= speed <= 2:
                 raise ValueError
             call_users = frozenset(
@@ -163,6 +165,12 @@ class Settings:
             voice_replies=voice_replies,
             enable_calls=calls == "true",
             call_users=call_users,
+            call_usernames=tuple(
+                v.strip().lstrip("@").lower()
+                for v in os.getenv("CALL_ALLOWED_USERNAMES", "").split(",")
+                if v.strip()
+            ),
+            fast_model=os.getenv("FAST_MODEL_NAME", "gemini-3.8-flash").strip(),
             history_turns=recent_turns,
             summary_threshold=threshold,
             history_chars=context_chars,

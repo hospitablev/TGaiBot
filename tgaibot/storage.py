@@ -4,6 +4,7 @@ import shutil
 import sqlite3
 import time
 
+from .call_history import CallHistory
 from .knowledge import Knowledge
 
 
@@ -73,6 +74,7 @@ class History:
             self.index_turn(row_id, user_id, raw)
         self.db.commit()
         self.knowledge = Knowledge(self.db)
+        self.calls = CallHistory(self.db)
         self.purge()
 
     def purge(self):

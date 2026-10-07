@@ -1,8 +1,4 @@
-"""Experimental inbound P2P audio: PCM -> local Whisper -> Claude -> Fish -> PCM.
-
-No real call has been validated without an authorized Telegram account. Dependencies
-are pinned because frame interfaces are version-specific. Never access local devices.
-"""
+"""Inbound-only calls with barge-in, bounded latency and durable recordings."""
 
 import asyncio
 import importlib.util
@@ -15,27 +11,26 @@ from array import array
 from contextlib import suppress
 from pathlib import Path
 
-from .media import run_tool
-from .tts import speech_text
-from .worker import prepare_isolated
+from .call_audio import BPS, MAX_SECONDS, RATE, REACTIONS, CallRecorder, ReactionBank, to_pcm
+from .call_brain import CallBrain
+from .tts import display_speech, speech_text
 
 LOG = logging.getLogger(__name__)
-SAMPLE_RATE = 48000
-BYTES_PER_SECOND = SAMPLE_RATE * 2
+SAMPLE_RATE = RATE
+BYTES_PER_SECOND = BPS
 
 
 def call_readiness(settings):
     missing = []
-    for package in ("pytgcalls", "ntgcalls", "faster_whisper"):
+    for package in ("pytgcalls", "ntgcalls"):
         if importlib.util.find_spec(package) is None:
             missing.append(package)
     if not settings.fish_key:
         missing.append("FISH_API_KEY")
     if not settings.transcription:
         missing.append("ENABLE_TRANSCRIPTION=true")
-    if not settings.call_users:
+    if not settings.call_users and not settings.call_usernames:
         missing.append("CALL_ALLOWED_USER_IDS")
-    # PyTgCalls itself expects these executable names on PATH.
     for executable in ("ffmpeg", "ffprobe"):
         if not shutil.which(executable):
             missing.append(executable)
@@ -43,28 +38,38 @@ def call_readiness(settings):
 
 
 class SpeechBuffer:
-    """Simple energy-based turn detection, mono PCM16/48kHz, max 20 seconds."""
+    """PCM16 VAD with noise floor, pre-roll and 600 ms end-of-turn pause."""
 
     def __init__(self):
         self.data = bytearray()
+        self.pre = bytearray()
         self.silence = 0
         self.voiced = 0
+        self.noise = 100.0
 
     def feed(self, frame):
         if len(frame) < 2 or len(frame) % 2:
             return None
         samples = array("h", frame)
-        energy = sum(v * v for v in samples) / len(samples)
-        loud = energy > 350 * 350
+        energy = (sum(v * v for v in samples) / len(samples)) ** 0.5
+        loud = energy > max(350, self.noise * 2.8)
+        if not loud and not self.data:
+            self.noise = 0.98 * self.noise + 0.02 * min(energy, 250)
         if loud:
+            if not self.data:
+                self.data.extend(self.pre)
+                self.pre.clear()
             self.voiced += len(frame)
             self.silence = 0
         elif self.data:
             self.silence += len(frame)
         if loud or self.data:
             self.data.extend(frame)
-        if self.silence >= BYTES_PER_SECOND or len(self.data) >= 20 * BYTES_PER_SECOND:
-            result = bytes(self.data) if self.voiced >= int(0.3 * BYTES_PER_SECOND) else None
+        else:
+            self.pre.extend(frame)
+            self.pre = self.pre[-int(0.12 * BPS) :]
+        if self.silence >= int(0.6 * BPS) or len(self.data) >= 20 * BPS:
+            result = bytes(self.data) if self.voiced >= int(0.25 * BPS) else None
             self.data.clear()
             self.silence = self.voiced = 0
             return result
@@ -77,179 +82,349 @@ class CallBridge:
         self.settings = bot.settings
         self.app = None
         self.task = None
+        self.turn_task = None
         self.chat_id = None
         self.listening = False
         self.buffer = SpeechBuffer()
-        self.queue = asyncio.Queue(maxsize=1)
+        self.queue = asyncio.Queue(maxsize=2)
         self.ended = asyncio.Event()
         self.enabled = False
+        self.generation = 0
+        self.identifier = None
+        self.allowed = set(self.settings.call_users)
+        self.recorder = None
+        self.bank = ReactionBank(self.settings, bot.tts)
+        self.brain = CallBrain(bot)
+        self.warm_task = None
+        self.play_lock = asyncio.Lock()
+        self.last_filler = 0
+        self.journal = bot.history.calls
+        self.failure_reason = None
+        self.start_time = 0
 
     async def start(self):
         from pytgcalls import PyTgCalls, filters
-        from pytgcalls.types import ChatUpdate, Direction
+        from pytgcalls.types import ChatUpdate, Device, Direction
 
+        for username in self.settings.call_usernames:
+            try:
+                entity = await self.bot.client.get_entity(username)
+                if not getattr(entity, "bot", False):
+                    self.allowed.add(entity.id)
+            except Exception:
+                LOG.warning("Не удалось разрешить разрешённое имя звонящего.")
         self.app = PyTgCalls(self.bot.client)
 
         @self.app.on_update(filters.chat_update(ChatUpdate.Status.INCOMING_CALL))
         async def incoming(_, update):
-            chat_id = update.chat_id
-            if (
-                not self.enabled
-                or self.chat_id is not None
-                or chat_id not in self.settings.call_users
-                or chat_id == self.bot.self_id
-                or self.bot.history.is_paused(chat_id)
-                or time.monotonic() < self.bot.blocked_until
-            ):
-                return
-            sender = await self.bot.client.get_entity(chat_id)
-            if getattr(sender, "bot", False) or not self.bot.history.reserve(chat_id):
-                return
-            if self.chat_id is not None:
-                return
-            self.chat_id = chat_id
-            self.ended.clear()
-            self.task = asyncio.create_task(self.session(chat_id))
+            await self.incoming(update.chat_id)
 
         @self.app.on_update(filters.chat_update(ChatUpdate.Status.LEFT_CALL))
         async def ended(_, update):
-            if update.chat_id == self.chat_id and not self.ended.is_set():
+            if update.chat_id == self.chat_id:
                 self.ended.set()
                 if self.task:
                     self.task.cancel()
 
         @self.app.on_update(filters.stream_frame(directions=Direction.INCOMING))
         async def frames(_, update):
-            from pytgcalls.types import Device
-
-            if (
-                update.chat_id != self.chat_id
-                or not self.listening
-                or self.bot.history.is_paused(update.chat_id)
-                or update.device not in (Device.MICROPHONE, Device.SPEAKER)
+            if update.chat_id != self.chat_id or update.device not in (
+                Device.MICROPHONE,
+                Device.SPEAKER,
             ):
                 return
             for frame in update.frames:
-                segment = self.buffer.feed(frame.frame)
-                if segment and not self.queue.full():
-                    self.queue.put_nowait(segment)
-                    self.listening = False
-                    break
+                self.feed(frame.frame)
 
         await self.app.start()
         self.enabled = True
-        LOG.warning("Экспериментальные входящие звонки включены только для CALL_ALLOWED_USER_IDS.")
+        self.warm_task = asyncio.create_task(self.prepare())
+        LOG.warning("Входящие звонки готовы; разрешённых собеседников: %s.", len(self.allowed))
 
-    async def speak(self, chat_id, text, directory):
+    async def prepare(self):
+        rows = self.journal.db.execute(
+            "SELECT id FROM call_events WHERE recording IS NULL AND status IN ('failed','ended') ORDER BY id DESC LIMIT 50"
+        ).fetchall()
+        for (identifier,) in rows:
+            root = self.settings.data_dir / "call-recordings" / str(identifier)
+            if not root.is_dir():
+                continue
+            try:
+                path = root / "recording.ogg"
+                if not path.is_file():
+                    path = await CallRecorder.encode(self.settings, root)
+                if path:
+                    self.journal.recording(identifier, path, 0)
+            except Exception:
+                LOG.warning("Не удалось восстановить запись звонка %s.", identifier)
+        await self.bank.prepare()
+
+    async def incoming(self, chat_id):
+        identifier = self.journal.incoming(chat_id)
+        reason = None
+        if not self.enabled:
+            reason = "unavailable"
+        elif chat_id not in self.allowed or chat_id == self.bot.self_id:
+            reason = "not_allowed"
+        elif self.chat_id is not None:
+            reason = "busy"
+        elif self.bot.history.is_paused(chat_id):
+            reason = "paused"
+        elif time.monotonic() < self.bot.blocked_until:
+            reason = "limited"
+        elif not self.bot.history.reserve_control(chat_id):
+            reason = "limited"
+        if reason:
+            self.journal.update(identifier, "declined", reason)
+            return
+        self.chat_id = chat_id
+        self.identifier = identifier
+        self.failure_reason = None
+        self.ended.clear()
+        self.buffer = SpeechBuffer()
+        self.generation += 1
+        self.journal.update(identifier, "connecting")
+        self.task = asyncio.create_task(self.session(chat_id))
+
+    def feed(self, frame):
+        if not self.listening or self.ended.is_set():
+            return
+        if self.recorder:
+            self.recorder.write("user", frame)
+        segment = self.buffer.feed(frame)
+        if (
+            (self.buffer.voiced >= int(0.18 * BPS) or segment)
+            and self.turn_task
+            and not self.turn_task.done()
+            and not self.turn_task.cancelling()
+        ):
+            self.generation += 1
+            self.turn_task.cancel()
+            if self.identifier:
+                self.journal.turn(self.identifier, interrupted=True)
+        if segment:
+            if self.queue.full():
+                self.queue.get_nowait()
+            self.queue.put_nowait(segment)
+
+    async def play_pcm(self, chat_id, path):
         from pytgcalls.types import Device
 
+        generation = self.generation
+        async with self.play_lock:
+            start = time.monotonic()
+            index = 0
+            with Path(path).open("rb") as audio:
+                while data := audio.read(1920):
+                    if (
+                        self.ended.is_set()
+                        or generation != self.generation
+                        or self.bot.history.is_paused(chat_id)
+                    ):
+                        return
+                    frame = data.ljust(1920, b"\0")
+                    await self.app.send_frame(chat_id, Device.MICROPHONE, frame)
+                    if self.recorder:
+                        self.recorder.write("assistant", frame)
+                    index += 1
+                    await asyncio.sleep(max(0, start + index * 0.02 - time.monotonic()))
+
+    async def speak(self, chat_id, text, directory):
         spoken, _ = speech_text(text, limit=1000)
         mp3 = await self.bot.tts.synthesize(spoken, directory / "speech.mp3")
-        pcm = directory / "speech.pcm"
-        await asyncio.to_thread(
-            run_tool,
-            [
-                self.settings.ffmpeg,
-                "-nostdin",
-                "-v",
-                "error",
-                "-y",
-                "-i",
-                str(mp3),
-                "-vn",
-                "-ac",
-                "1",
-                "-ar",
-                "48000",
-                "-f",
-                "s16le",
-                "-t",
-                "90",
-                str(pcm),
-            ],
-        )
+        pcm = await to_pcm(self.settings, mp3, directory / "speech.pcm")
+        await self.play_pcm(chat_id, pcm)
+
+    async def clip(self, chat_id, key, directory):
+        path = self.bank.path(key)
+        if path:
+            await self.play_pcm(chat_id, path)
+        else:
+            await self.speak(chat_id, REACTIONS[key], directory)
+
+    async def thinking(self, chat_id):
+        await asyncio.sleep(1.4)
+        if self.buffer.voiced or time.monotonic() - self.last_filler < 12:
+            return
+        key = self.bank.choose("think")
+        if key:
+            self.last_filler = time.monotonic()
+            await self.play_pcm(chat_id, self.bank.path(key))
+
+    async def process(self, chat_id, segment, directory):
+        generation = self.generation
+        epoch = self.bot.history.epoch(chat_id)
+
+        def valid():
+            return (
+                not self.ended.is_set()
+                and generation == self.generation
+                and self.bot.history.epoch(chat_id) == epoch
+            )
+
+        identifier = -time.time_ns()
+        answer = ""
         start = time.monotonic()
-        with pcm.open("rb") as audio:
-            index = 0
-            while data := audio.read(1920):
-                if self.ended.is_set() or self.bot.history.is_paused(chat_id):
+        filler = asyncio.create_task(self.thinking(chat_id))
+        try:
+            path = directory / "utterance.wav"
+            with wave.open(str(path), "wb") as audio:
+                audio.setnchannels(1)
+                audio.setsampwidth(2)
+                audio.setframerate(RATE)
+                audio.writeframes(segment)
+            async with asyncio.timeout(40):
+                plan = await self.brain.understand(chat_id, path)
+                if not valid():
                     return
-                await self.app.send_frame(chat_id, Device.MICROPHONE, data.ljust(1920, b"\0"))
-                index += 1
-                await asyncio.sleep(max(0, start + index * 0.02 - time.monotonic()))
+                transcript = plan["transcript"].strip()
+                if not transcript:
+                    await self.clip(chat_id, "repeat_1", directory)
+                    return
+                self.journal.transcript(self.identifier, "user", transcript)
+                filler.cancel()
+                await asyncio.gather(filler, return_exceptions=True)
+                group = (
+                    "search"
+                    if plan["action"] == "search"
+                    else "listen"
+                    if plan["action"] == "reply" and plan["reaction"] == "listen"
+                    else None
+                )
+                if group and self.last_filler < start:
+                    key = self.bank.choose(group)
+                    if key:
+                        self.last_filler = time.monotonic()
+                        await self.play_pcm(chat_id, self.bank.path(key))
+                answer = await self.brain.act(chat_id, identifier, plan, valid)
+                if not valid():
+                    return
+                if plan["action"] == "task" and self.last_filler < start and "сохранил" in answer:
+                    key = self.bank.choose("task")
+                    if key:
+                        self.last_filler = time.monotonic()
+                        await self.play_pcm(chat_id, self.bank.path(key))
+                filler.cancel()
+                await asyncio.gather(filler, return_exceptions=True)
+                self.journal.turn(self.identifier, latency_ms=(time.monotonic() - start) * 1000)
+                await self.speak(chat_id, answer, directory)
+                if not valid():
+                    return
+                self.journal.transcript(self.identifier, "assistant", display_speech(answer))
+                self.bot.history.add(chat_id, identifier, transcript, display_speech(answer))
+                self.bot.history.knowledge.enqueue(chat_id, identifier, transcript, origin="voice")
+                self.bot.memory.wakeup.set()
+        except asyncio.CancelledError:
+            if answer:
+                self.journal.transcript(
+                    self.identifier, "assistant", display_speech(answer), interrupted=True
+                )
+            raise
+        except Exception as exc:
+            LOG.warning("Реплика звонка не завершена (%s).", type(exc).__name__)
+            if valid():
+                with suppress(Exception):
+                    await asyncio.wait_for(self.clip(chat_id, "connection", directory), 12)
+        finally:
+            filler.cancel()
+            await asyncio.gather(filler, return_exceptions=True)
 
     async def session(self, chat_id):
         from ntgcalls import MediaSource
         from pytgcalls.types import CallConfig, RecordStream
         from pytgcalls.types.raw import AudioParameters, AudioStream, Stream
 
+        if self.identifier is None:
+            self.identifier = self.journal.incoming(chat_id)
+        connected = False
+        self.start_time = time.monotonic()
         try:
-            async with asyncio.timeout(180):
+            async with asyncio.timeout(MAX_SECONDS):
                 with tempfile.TemporaryDirectory(prefix="tgaibot-call-") as temp:
                     directory = Path(temp)
-                    # Empty external PCM source: never open the machine's microphone/camera.
                     stream = Stream(
-                        microphone=AudioStream(
-                            MediaSource.EXTERNAL, "", AudioParameters(SAMPLE_RATE, 1)
-                        )
+                        microphone=AudioStream(MediaSource.EXTERNAL, "", AudioParameters(RATE, 1))
                     )
                     await self.app.play(chat_id, stream, CallConfig(timeout=30))
+                    connected = True
+                    self.recorder = CallRecorder(self.settings, self.identifier)
                     await self.app.record(
-                        chat_id,
-                        RecordStream(audio=True, audio_parameters=AudioParameters(SAMPLE_RATE, 1)),
+                        chat_id, RecordStream(audio=True, audio_parameters=AudioParameters(RATE, 1))
                     )
-                    await self.speak(
-                        chat_id,
-                        "Здравствуйте. Это ИИ-ассистент. Речь распознаётся локально; "
-                        "текст обрабатывается Клодом, ответы озвучивает Fish Audio. "
-                        "Говорите по очереди, короткими фразами. Я слушаю.",
-                        directory,
-                    )
+                    self.journal.update(self.identifier, "active")
+                    self.listening = True
+                    self.turn_task = asyncio.create_task(self.clip(chat_id, "hello", directory))
+                    try:
+                        await self.turn_task
+                    except asyncio.CancelledError:
+                        if self.ended.is_set():
+                            raise
+                    idle = 0
+                    utterances = 0
                     while not self.ended.is_set() and not self.bot.history.is_paused(chat_id):
-                        self.buffer = SpeechBuffer()
-                        self.listening = True
-                        segment = await asyncio.wait_for(self.queue.get(), timeout=45)
-                        self.listening = False
-                        path = directory / "utterance.wav"
-                        with wave.open(str(path), "wb") as audio:
-                            audio.setnchannels(1)
-                            audio.setsampwidth(2)
-                            audio.setframerate(SAMPLE_RATE)
-                            audio.writeframes(segment)
-                        async with self.bot.slots:
-                            prepared = await prepare_isolated(path, self.settings)
-                            if "Речь не найдена." in prepared.text:
-                                continue
-                            if not self.bot.history.reserve(chat_id, min_interval=0):
+                        try:
+                            segment = await asyncio.wait_for(self.queue.get(), 45)
+                        except TimeoutError:
+                            if idle:
                                 break
-                            content = (
-                                "Реплика собеседника в голосовом звонке. Ответь кратко, "
-                                "до 600 символов, без Markdown.\n" + prepared.text
-                            )
-                            epoch = self.bot.history.epoch(chat_id)
-                            context, _ = await self.bot.memory.context(chat_id, content)
-                            answer = await self.bot.provider.answer(
-                                [*context, {"role": "user", "content": content}], max_tokens=512
-                            )
-                            if self.bot.history.epoch(chat_id) != epoch:
-                                continue
-                            self.bot.history.add(chat_id, -time.time_ns(), content, answer)
-                        await self.speak(chat_id, answer, directory)
+                            idle += 1
+                            await self.clip(chat_id, "silence", directory)
+                            continue
+                        idle = 0
+                        utterances += 1
+                        if utterances > 120:
+                            self.failure_reason = "limited"
+                            break
+                        self.turn_task = asyncio.create_task(
+                            self.process(chat_id, segment, directory)
+                        )
+                        try:
+                            await self.turn_task
+                        except asyncio.CancelledError:
+                            if self.ended.is_set():
+                                raise
         except asyncio.CancelledError:
             pass
+        except TimeoutError:
+            self.failure_reason = "timeout"
         except Exception as exc:
-            LOG.warning("Звонок завершён (%s); переписка остаётся доступна.", type(exc).__name__)
+            self.failure_reason = "processing" if connected else "connection"
+            LOG.warning("Звонок завершён (%s).", type(exc).__name__)
         finally:
             self.listening = False
             self.ended.set()
+            if self.turn_task and not self.turn_task.done():
+                self.turn_task.cancel()
+                await asyncio.gather(self.turn_task, return_exceptions=True)
             with suppress(Exception):
-                await self.app.leave_call(chat_id)
+                await asyncio.wait_for(self.app.leave_call(chat_id), 5)
+            self.journal.update(
+                self.identifier,
+                "failed" if self.failure_reason else "ended",
+                self.failure_reason or "ended",
+            )
+            if self.recorder:
+                try:
+                    path = await self.recorder.finish()
+                    self.journal.recording(
+                        self.identifier, path or "", time.monotonic() - self.start_time
+                    )
+                except Exception:
+                    LOG.warning("Запись звонка оставлена в PCM для восстановления.")
+            self.recorder = None
             self.chat_id = None
+            self.turn_task = None
             while not self.queue.empty():
                 self.queue.get_nowait()
 
     async def close(self):
         self.enabled = False
+        self.ended.set()
         if self.task and not self.task.done():
+            self.failure_reason = "restart"
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
+        if self.warm_task:
+            self.warm_task.cancel()
+            await asyncio.gather(self.warm_task, return_exceptions=True)
+        await self.brain.close()

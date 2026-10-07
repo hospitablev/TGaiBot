@@ -12,7 +12,7 @@ def test_voice_segmentation_and_silence():
     assert buffer.feed(b"\0" * 96000) is None
     assert buffer.feed(array("h", [1000] * 24000).tobytes()) is None
     segment = buffer.feed(b"\0" * BYTES_PER_SECOND)
-    assert segment and len(segment) == int(1.5 * BYTES_PER_SECOND)
+    assert segment and len(segment) == int(1.62 * BYTES_PER_SECOND)
     assert not buffer.data
 
 
@@ -52,7 +52,6 @@ async def test_call_pipeline_with_mock_transport(settings, history, monkeypatch)
     from unittest.mock import AsyncMock
 
     from tgaibot import calls
-    from tgaibot.media import Prepared
     from tgaibot.userbot import Userbot
 
     bot = Userbot(
@@ -68,13 +67,19 @@ async def test_call_pipeline_with_mock_transport(settings, history, monkeypatch)
 
     async def speak(chat, text, directory):
         if "Короткий ответ" in text:
-            bridge.ended.set()
+            asyncio.get_running_loop().call_soon(bridge.ended.set)
         else:
             bridge.queue.put_nowait(array("h", [1000] * 24000).tobytes())
 
     bridge.speak = AsyncMock(side_effect=speak)
-    monkeypatch.setattr(
-        calls, "prepare_isolated", AsyncMock(return_value=Prepared(text="Тестовая реплика"))
+    bridge.brain.understand = AsyncMock(
+        return_value={
+            "transcript": "Тестовая реплика",
+            "speech": "Короткий ответ",
+            "action": "reply",
+            "query": "",
+            "reaction": "none",
+        }
     )
     await asyncio.wait_for(bridge.session(10), timeout=5)
     bridge.app.play.assert_awaited_once()
@@ -83,3 +88,4 @@ async def test_call_pipeline_with_mock_transport(settings, history, monkeypatch)
     assert bridge.speak.await_count == 2
     assert history.messages(10)[-1]["content"] == "Короткий ответ"
     assert bridge.chat_id is None
+    await bridge.close()

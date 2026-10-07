@@ -571,7 +571,7 @@ class TaskManager:
                                 args,
                                 self.settings.data_dir / "attachments" / str(user_id),
                                 user_id,
-                                row["source_id"],
+                                row["source_id"] if row["source_id"] > 0 else None,
                                 state["places"],
                                 valid,
                             )

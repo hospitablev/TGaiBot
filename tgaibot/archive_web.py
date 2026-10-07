@@ -157,6 +157,29 @@ def create_app(settings, archiver=None, *, metrics=None, history=None):
             "text": history.knowledge.display(dialog_id),
         }
 
+    @app.get("/api/dialogs/{dialog_id}/calls")
+    async def person_calls(dialog_id: int, before: int = 0):
+        if history is None:
+            raise HTTPException(409, "Журнал доступен при запущенном помощнике.")
+        return history.calls.list(dialog_id, before)
+
+    @app.get("/api/calls/{call_id}/audio")
+    async def call_recording(call_id: int):
+        row = (
+            history.db.execute(
+                "SELECT recording FROM call_events WHERE id=?", (call_id,)
+            ).fetchone()
+            if history
+            else None
+        )
+        if not row or not row[0]:
+            raise HTTPException(404, "Запись недоступна.")
+        root = (settings.data_dir / "call-recordings").resolve()
+        path = Path(row[0]).resolve()
+        if not path.is_relative_to(root) or not path.is_file():
+            raise HTTPException(404, "Запись недоступна.")
+        return FileResponse(path, media_type="audio/ogg", filename=f"call-{call_id}.ogg")
+
     @app.get("/api/dialogs")
     async def dialogs(q: str = "", offset: int = 0):
         q = q[:200]

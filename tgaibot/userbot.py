@@ -598,6 +598,11 @@ class Userbot:
                             path = await self.download(message, Path(temp) / str(index))
                             self.history.archive_attachment(user_id, message.id, path)
                             part = await prepare_isolated(path, self.settings)
+                            if (
+                                getattr(message, "video", False)
+                                or getattr(message, "video_note", False)
+                            ) and getattr(self, "perception", None):
+                                part = await self.perception.video(part, message.message or "")
                             if self.history.epoch(user_id) == request_epoch:
                                 self.memory.enqueue_voice(user_id, message, part)
                             combined.text += "\n" + part.text
@@ -710,6 +715,8 @@ async def run(settings):
     web_task = None
     task_manager = None
     memory = None
+    perception = None
+    archive.call_journal = history.calls
     try:
         await client.connect()
         if not await client.is_user_authorized():
@@ -720,6 +727,28 @@ async def run(settings):
         if me.bot:
             raise RuntimeError("Нужна сессия обычного Telegram-аккаунта.")
         client.archive_sink = archiver.observe
+
+        @client.on(events.Raw())
+        async def call_event(update):
+            from telethon.tl.types import PhoneCallDiscarded, PhoneCallRequested, UpdatePhoneCall
+
+            if not isinstance(update, UpdatePhoneCall):
+                return
+            call = update.phone_call
+            if isinstance(call, PhoneCallRequested):
+                identifier = history.calls.incoming(call.admin_id, call.id)
+                if not settings.enable_calls or not calls or not calls.enabled:
+                    history.calls.update(
+                        identifier,
+                        "missed",
+                        "disabled" if not settings.enable_calls else "unavailable",
+                    )
+            elif isinstance(call, PhoneCallDiscarded):
+                row = history.db.execute(
+                    "SELECT id,status FROM call_events WHERE telegram_id=?", (call.id,)
+                ).fetchone()
+                if row and row[1] in {"ringing", "connecting"}:
+                    history.calls.update(row[0], "missed", "unknown")
 
         @client.on(events.NewMessage())
         async def archive_new(event):
@@ -782,6 +811,10 @@ async def run(settings):
         task_manager.start()
         memory = bot.memory
         memory.start()
+        from .call_brain import Perception
+
+        perception = Perception(settings, metrics)
+        bot.perception = perception
         if settings.enable_calls:
             from .calls import CallBridge, call_readiness
 
@@ -794,6 +827,7 @@ async def run(settings):
                 calls = CallBridge(bot)
                 try:
                     await calls.start()
+                    bot.agent.call_bridge = calls
                 except Exception as exc:
                     LOG.warning("Звонки не запущены (%s); сообщения работают.", type(exc).__name__)
                     await calls.close()
@@ -854,6 +888,8 @@ async def run(settings):
             await task_manager.close()
         if memory:
             await memory.close()
+        if perception:
+            await perception.close()
         await client.disconnect()
         await archiver.close()
         archive.close()
