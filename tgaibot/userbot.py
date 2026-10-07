@@ -24,6 +24,7 @@ from .provider import Provider, ProviderError
 from .search import Search
 from .storage import History, image_count, text_size
 from .tts import FishTTS, TTSError
+from .turns import CURRENT_TURN, SEND_TYPES, RetryTurn, TurnQueue
 from .worker import prepare_isolated
 
 LOG = logging.getLogger(__name__)
@@ -97,6 +98,14 @@ class IncomingOnlyTelegramClient(TelegramClient):
         requests = request if isinstance(request, (list, tuple)) else [request]
         if any(isinstance(item, functions.phone.RequestCallRequest) for item in requests):
             raise RuntimeError("Исходящие звонки запрещены: принимаются только входящие.")
+        turn = CURRENT_TURN.get()
+        if turn and isinstance(request, SEND_TYPES):
+            return await turn.rpc(
+                request,
+                lambda saved: super(IncomingOnlyTelegramClient, self).__call__(
+                    saved, *args, **kwargs
+                ),
+            )
         return await super().__call__(request, *args, **kwargs)
 
 
@@ -204,14 +213,13 @@ class Userbot:
         )
         self.self_id = self_id
         self.started = datetime.now(timezone.utc).replace(microsecond=0)
-        self.locks = {}
         self.slots = asyncio.Semaphore(2)
-        self.active = 0
         self.blocked_until = 0.0
         self.tts = tts
         self.memory = Memory(settings, history, provider)
         self.images = images
         self.agent = agent
+        self.queue = TurnQueue(self)
         if self.agent:
             self.agent.memory = self.memory
             self.agent.tts = self.tts
@@ -246,7 +254,7 @@ class Userbot:
         ):
             return
         text = (event.raw_text or "").strip().lower()
-        if text not in {"/admin", "/stats", "/stats all", "/memory"}:
+        if text not in {"/admin", "/stats", "/stats all", "/memory", "/queue"}:
             return
         if self.history.seen(self.self_id, event.id):
             return
@@ -254,7 +262,9 @@ class Userbot:
         from .metrics import memory_report
 
         if text == "/admin":
-            answer = "Команды владельца в Избранном:\n/stats: статистика и расходы за сегодня\n/stats all: за всё время\n/memory: состояние памяти"
+            answer = "Команды владельца в Избранном:\n/stats: статистика и расходы за сегодня\n/stats all: за всё время\n/memory: состояние памяти\n/queue: незавершённые ответы и отправки"
+        elif text == "/queue":
+            answer = self.queue.report()
         elif text == "/memory":
             answer = memory_report(self.history, self.settings)
         else:
@@ -266,7 +276,7 @@ class Userbot:
             )
         await self.reply(event, answer)
 
-    async def eligible(self, event):
+    async def eligible(self, event, *, restored=False):
         if (
             not event.is_private
             or event.out
@@ -291,7 +301,7 @@ class Userbot:
             .startswith(("[ии-ассистент]", "[ai assistant]", "[ai-assistant]"))
         ):
             return False
-        if message.date < self.started:
+        if not restored and message.date < self.started:
             return False
         return True
 
@@ -343,21 +353,9 @@ class Userbot:
 
     async def handle(self, event, messages=None):
         try:
-            if not await self.eligible(event) or time.monotonic() < self.blocked_until:
+            if not await self.eligible(event):
                 return
-            user_id = event.sender_id
-            # Bounded queue prevents incoming bursts from accumulating parsing/model jobs.
-            if self.active >= 8:
-                return
-            lock = self.locks.setdefault(user_id, asyncio.Lock())
-            self.active += 1
-            try:
-                async with lock:
-                    await self.process(event, messages or [event.message])
-            finally:
-                self.active -= 1
-                if not lock.locked() and not getattr(lock, "_waiters", None):
-                    self.locks.pop(user_id, None)
+            await self.queue.submit(event, messages or [event.message])
         except errors.FloodWaitError as exc:
             self.blocked_until = time.monotonic() + exc.seconds
             LOG.warning(
@@ -370,14 +368,23 @@ class Userbot:
 
     async def process(self, event, messages):
         user_id = event.sender_id
+        turn = CURRENT_TURN.get()
+        if time.monotonic() < self.blocked_until:
+            raise RetryTurn(self.blocked_until - time.monotonic() + 1)
         request_epoch = self.history.epoch(user_id)
         if any(self.history.changed(user_id, message.id) for message in messages):
             return
-        if self.history.seen(user_id, event.id):
+        if not turn and self.history.seen(user_id, event.id):
             return
         for message in messages:
-            self.history.mark_seen(user_id, message.id)
+            if not turn:
+                self.history.mark_seen(user_id, message.id)
             self.history.archive_incoming(user_id, message)
+        if hasattr(self.client, "send_read_acknowledge"):
+            try:
+                await self.client.send_read_acknowledge(user_id, max_id=max(m.id for m in messages))
+            except errors.RPCError as exc:
+                LOG.warning("Отметка прочтения не отправлена (%s).", type(exc).__name__)
         text = event.raw_text or ""
         command = control_intent(text)
         tasks = self.agent.tasks if self.agent else None
@@ -502,12 +509,18 @@ class Userbot:
             "/ai_voice_on",
             "/ai_voice_off",
         } or command.startswith("/ai_recall")
-        permitted = (
-            self.history.reserve_control(user_id) if is_control else self.history.reserve(user_id)
+        permitted = bool(turn and turn.data.get("reserved")) or (
+            self.history.reserve_control(user_id)
+            if is_control
+            else self.history.reserve(user_id, min_interval=0 if turn else 10)
         )
         if not permitted:
-            # No reply to rate-limited messages: prevents automated reply loops.
+            if turn:
+                raise RetryTurn(60 if is_control else self.history.reserve_delay(user_id))
             return
+        if turn:
+            turn.data["reserved"] = True
+            turn.save()
         if command in {"/ai_start", "/ai_help"}:
             await self.reply(
                 event, HELP if command == "/ai_help" else "Я снова на связи. О чём поговорим?"
@@ -561,7 +574,11 @@ class Userbot:
                         / str(user_id)
                         / f"generated-{event.id}.png"
                     )
-                    generated = await self.images.generate(prompt, target)
+                    if turn:
+                        turn.sending("image")
+                    generated = (
+                        target if target.is_file() else await self.images.generate(prompt, target)
+                    )
                     if self.history.epoch(user_id) != request_epoch:
                         return
                     content = [
@@ -602,6 +619,21 @@ class Userbot:
                             self.history.archive_attachment(user_id, message.id, path)
                             part = await prepare_isolated(path, self.settings)
                             if (
+                                getattr(message, "voice", False)
+                                or getattr(message, "video_note", False)
+                            ) and "Расшифровка речи (может содержать ошибки):" in part.text:
+                                try:
+                                    await self.client(
+                                        functions.messages.ReadMessageContentsRequest(
+                                            id=[message.id]
+                                        )
+                                    )
+                                except errors.RPCError as exc:
+                                    LOG.warning(
+                                        "Отметка прослушивания не отправлена (%s).",
+                                        type(exc).__name__,
+                                    )
+                            if (
                                 getattr(message, "video", False)
                                 or getattr(message, "video_note", False)
                             ) and getattr(self, "perception", None):
@@ -625,12 +657,36 @@ class Userbot:
                     epoch = request_epoch
                     if self.history.epoch(user_id) != epoch:
                         return
-                    history, memory_notice = await self.memory.context(user_id, content)
+                    if turn and "input" in turn.data:
+                        saved = turn.data["input"]
+                        content, history, memory_notice = (
+                            saved["content"],
+                            saved["history"],
+                            saved["notice"],
+                        )
+                    else:
+                        history, memory_notice = await self.memory.context(user_id, content)
+                        if turn:
+                            turn.data["input"] = {
+                                "content": content,
+                                "history": history,
+                                "notice": memory_notice,
+                            }
+                            turn.save()
                     if self.history.epoch(user_id) != epoch:
                         return
                     model_messages = [*history, {"role": "user", "content": content}]
                     background = background_request(text)
-                    if background and tasks:
+                    if turn and "answer" in turn.data:
+                        from .agent import AgentReply
+
+                        answer = AgentReply(
+                            turn.data["answer"],
+                            voice_attempted=turn.data.get("voice_attempted", False),
+                        )
+                    elif background and tasks:
+                        if turn:
+                            turn.seal()
                         created = tasks.create(
                             user_id,
                             event.id,
@@ -653,6 +709,10 @@ class Userbot:
                         answer = await self.provider.answer(model_messages)
                     if self.history.epoch(user_id) != epoch:
                         return
+                    if turn:
+                        turn.data["answer"] = str(answer)
+                        turn.data["voice_attempted"] = getattr(answer, "voice_attempted", False)
+                        turn.sending("final")
                     self.history.add(
                         user_id, event.id, content, answer, source_ids=[m.id for m in messages]
                     )
@@ -674,6 +734,8 @@ class Userbot:
                         and not getattr(answer, "voice_attempted", False)
                     ):
                         try:
+                            if turn:
+                                turn.sending("auto_voice")
                             voice, truncated = await self.tts.voice_note(answer, Path(temp))
                             if self.history.epoch(user_id) != epoch:
                                 return
@@ -859,8 +921,10 @@ async def run(settings):
                 history.purge()
 
         maintenance = asyncio.create_task(cleanup())
+        bot.queue.recovery = asyncio.create_task(bot.queue.restore())
+        bot.queue.start()
         print(
-            "Юзербот запущен. Отвечает только на новые входящие личные сообщения. Ctrl+C — остановить."
+            "Юзербот запущен. Очередь ответов и восстановление после перезапуска включены. Ctrl+C — остановить."
         )
         if web_task:
             telegram_task = asyncio.create_task(client.run_until_disconnected())
@@ -875,6 +939,8 @@ async def run(settings):
         else:
             await client.run_until_disconnected()
     finally:
+        if "bot" in locals():
+            await bot.queue.close()
         if web_server:
             web_server.should_exit = True
         if web_task:

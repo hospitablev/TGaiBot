@@ -175,6 +175,9 @@ class Agent:
     async def answer(
         self, messages, user_id, reply_to, is_current=lambda: True, *, voice_default=False
     ):
+        from .turns import CURRENT_TURN, DeliveryUncertain
+
+        turn = CURRENT_TURN.get()
         conversation = list(messages)
         available = bool(
             self.tts and self.settings.fish_key and self.settings.voice_replies != "off"
@@ -226,9 +229,15 @@ class Agent:
         directory = self.settings.data_dir / "attachments" / str(user_id)
         count = 0
         try:
-            for _ in range(5):
-                response = await self.provider.step(
-                    conversation, TOOLS + VOICE_TOOLS + (TASK_TOOLS if self.tasks else [])
+            for step_number in range(5):
+
+                async def request_step():
+                    return await self.provider.step(
+                        conversation, TOOLS + VOICE_TOOLS + (TASK_TOOLS if self.tasks else [])
+                    )
+
+                response = (
+                    await turn.step(step_number, request_step) if turn else await request_step()
                 )
                 if not is_current():
                     return "Запрос отменён после очистки памяти."
@@ -280,23 +289,29 @@ class Agent:
                                     voice_attempted = True
                                     if isinstance(args["text"], str):
                                         voice_fallback = display_speech(args["text"][:1500])
-                                if name in TASK_SCHEMAS and self.tasks:
-                                    if name == "create_task":
-                                        result = self.tasks.create(
-                                            user_id, reply_to, messages, **args
-                                        )
-                                    elif name == "list_tasks":
-                                        result = {"tasks": self.tasks.store.list(user_id)}
-                                    elif name == "get_task":
-                                        result = self.tasks.store.describe(user_id, **args)
-                                    elif name == "cancel_task":
-                                        result = await self.tasks.cancel(user_id, **args)
-                                    else:
-                                        result = self.tasks.resume(user_id, **args)
-                                else:
-                                    result = await self.execute(
+
+                                async def execute_once():
+                                    if name in TASK_SCHEMAS and self.tasks:
+                                        if name == "create_task":
+                                            return self.tasks.create(
+                                                user_id, reply_to, messages, **args
+                                            )
+                                        if name == "list_tasks":
+                                            return {"tasks": self.tasks.store.list(user_id)}
+                                        if name == "get_task":
+                                            return self.tasks.store.describe(user_id, **args)
+                                        if name == "cancel_task":
+                                            return await self.tasks.cancel(user_id, **args)
+                                        return self.tasks.resume(user_id, **args)
+                                    return await self.execute(
                                         name, args, directory, user_id, reply_to, places, is_current
                                     )
+
+                                result = (
+                                    await turn.tool(name, args, places, execute_once)
+                                    if turn
+                                    else await execute_once()
+                                )
                                 executed[key] = result
                                 if name == "send_voice" and result.get("sent"):
                                     voice_transcript = result["transcript"]
@@ -306,10 +321,12 @@ class Agent:
                                     receipts.append(
                                         f"сохранена фоновая задача #{result['task_id']}"
                                     )
-                        except errors.RPCError:
+                        except (errors.RPCError, DeliveryUncertain):
                             # Never retry a Telegram send with an unknown delivery outcome.
                             raise
                         except Exception as exc:
+                            if turn and isinstance(exc, (OSError, TimeoutError)):
+                                raise
                             LOG.warning("Действие не завершено (%s)", type(exc).__name__)
                             result = {
                                 "error": str(exc)
@@ -318,6 +335,8 @@ class Agent:
                             }
                             if key is not None:
                                 executed[key] = result
+                                if turn:
+                                    turn.remember_tool(name, args, places, result)
                     conversation.append(
                         {
                             "role": "tool",
@@ -327,9 +346,11 @@ class Agent:
                     )
                 if count >= 8:
                     break
-        except errors.RPCError:
+        except (errors.RPCError, DeliveryUncertain):
             raise
-        except Exception:
+        except Exception as exc:
+            if turn and isinstance(exc, (OSError, TimeoutError)):
+                raise
             if not receipts and not voice_fallback:
                 raise
             LOG.warning("Действия выполнены, итоговый ответ недоступен")
@@ -446,7 +467,18 @@ class Agent:
         }.get(name)
         if not creator:
             raise ValueError("Неизвестное действие.")
-        path = await asyncio.to_thread(creator, directory, **args)
+        from .turns import CURRENT_TURN
+
+        turn = CURRENT_TURN.get()
+        saved_path = turn.data.get("artifacts", {}).get(turn.scope) if turn else None
+        path = (
+            Path(saved_path)
+            if saved_path and Path(saved_path).is_file()
+            else await asyncio.to_thread(creator, directory, **args)
+        )
+        if turn:
+            turn.data.setdefault("artifacts", {})[turn.scope] = str(path)
+            turn.save()
         if not is_current():
             path.unlink(missing_ok=True)
             raise ValueError("Запрос отменён после очистки памяти.")

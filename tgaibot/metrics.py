@@ -235,8 +235,15 @@ def memory_report(history, settings):
     call_count, failed_calls, call_turns, interruptions, latency = db.execute(
         "SELECT count(*),coalesce(sum(status IN ('missed','failed','declined')),0),coalesce(sum(turns),0),coalesce(sum(interruptions),0),coalesce(sum(latency_ms),0) FROM call_events"
     ).fetchone()
+    queue_text = ""
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='reply_jobs'").fetchone():
+        queued, working, attention = db.execute(
+            "SELECT coalesce(sum(status='pending'),0),coalesce(sum(status='running'),0),coalesce(sum(status='attention'),0) FROM reply_jobs"
+        ).fetchone()
+        queue_text = f"Ответы: {queued} в очереди, {working} обрабатываются, {attention} требуют проверки отправки.\n\n"
     return (
-        f"Звонков: {call_count}; пропущено/сбои/отклонено: {failed_calls}; реплик: {call_turns}; перебиваний: {interruptions}.\n"
+        queue_text
+        + f"Звонков: {call_count}; пропущено/сбои/отклонено: {failed_calls}; реплик: {call_turns}; перебиваний: {interruptions}.\n"
         f"Среднее время подготовки ответа в звонке: {round(latency / call_turns / 1000, 1) if call_turns else 0} с (без синтеза).\n\n"
         f"Карточки: {facts} активных фактов, {conflicts} противоречивых записей.\n"
         f"Ожидают подтверждения из голосовых: {unconfirmed}.\n"

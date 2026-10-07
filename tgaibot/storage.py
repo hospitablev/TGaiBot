@@ -143,6 +143,24 @@ class History:
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO voice VALUES(?,?)", (user_id, int(enabled)))
 
+    def reserve_delay(self, user_id):
+        now = time.time()
+        delays = [1.0]
+        for seconds, limit, global_scope in (
+            (600, 6, False),
+            (3600, 30, False),
+            (86400, 200, True),
+        ):
+            rows = self.db.execute(
+                "SELECT created FROM usage WHERE created>?"
+                + ("" if global_scope else " AND user_id=?")
+                + " ORDER BY created",
+                (now - seconds,) if global_scope else (now - seconds, user_id),
+            ).fetchall()
+            if len(rows) >= limit:
+                delays.append(rows[len(rows) - limit][0] + seconds - now + 1)
+        return max(delays)
+
     def reserve_control(self, user_id):
         now = time.time()
         with self.db:

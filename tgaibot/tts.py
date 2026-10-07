@@ -1,6 +1,7 @@
 """Fish Audio TTS. The Claude key is never used by this client."""
 
 import asyncio
+import hashlib
 import re
 
 import httpx
@@ -127,8 +128,20 @@ class FishTTS:
 
     async def voice_note(self, text, directory):
         spoken, truncated = speech_text(text)
+        from .turns import CURRENT_TURN
+
+        turn = CURRENT_TURN.get()
+        if turn:
+            fingerprint = hashlib.sha256(
+                f"{turn.scope}|{spoken}|{self.settings.fish_speed}|{self.settings.fish_voice}|{self.settings.fish_model}".encode()
+            ).hexdigest()[:24]
+            directory = self.settings.data_dir / "reply-media" / str(turn.id) / fingerprint
+            directory.mkdir(parents=True, exist_ok=True)
+            if (directory / "answer.ogg").is_file():
+                return directory / "answer.ogg", truncated
         mp3 = await self.synthesize(spoken, directory / "answer.mp3")
         ogg = directory / "answer.ogg"
+        part = directory / "answer.part.ogg"
         await asyncio.to_thread(
             run_tool,
             [
@@ -148,7 +161,8 @@ class FishTTS:
                 "libopus",
                 "-b:a",
                 "32k",
-                str(ogg),
+                str(part),
             ],
         )
+        part.replace(ogg)
         return ogg, truncated
