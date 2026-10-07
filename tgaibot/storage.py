@@ -4,6 +4,8 @@ import shutil
 import sqlite3
 import time
 
+from .knowledge import Knowledge
+
 
 def text_size(content):
     if isinstance(content, str):
@@ -70,6 +72,7 @@ class History:
         ).fetchall():
             self.index_turn(row_id, user_id, raw)
         self.db.commit()
+        self.knowledge = Knowledge(self.db)
         self.purge()
 
     def purge(self):
@@ -159,8 +162,8 @@ class History:
     def recent(self, user_id, current=None):
         self.purge()
         rows = self.db.execute(
-            "SELECT id,content FROM turns WHERE user_id=? ORDER BY id DESC LIMIT ?",
-            (user_id, self.settings.history_turns),
+            "SELECT id,content FROM turns WHERE user_id=? AND created>? ORDER BY id DESC LIMIT ?",
+            (user_id, self.knowledge.recall_after(user_id), self.settings.history_turns),
         ).fetchall()
         selected = []
         chars = text_size(current) if current is not None else 0
@@ -248,6 +251,9 @@ class History:
                     "INSERT INTO epochs VALUES(?,1) ON CONFLICT(user_id) DO UPDATE SET epoch=epoch+1",
                     (uid,),
                 )
+            for mid in message_ids:
+                for uid in affected:
+                    self.knowledge.invalidate(uid, mid, replacement)
         return affected
 
     def changed(self, user_id, message_id):
@@ -306,13 +312,14 @@ class History:
             return []
         expression = " OR ".join('"' + w.replace('"', "") + '"*' for w in words)
         rows = self.db.execute(
-            "SELECT turn_id,text FROM archive_search WHERE archive_search MATCH ? AND user_id=? ORDER BY rank LIMIT 40",
-            (expression, user_id),
+            "SELECT turn_id,text FROM archive_search WHERE archive_search MATCH ? AND user_id=? AND turn_id IN (SELECT id FROM turns WHERE user_id=? AND created>?) ORDER BY rank LIMIT 40",
+            (expression, user_id, user_id, self.knowledge.recall_after(user_id)),
         ).fetchall()
         return [(row_id, text) for row_id, text in rows if row_id not in exclude_ids][:limit]
 
     def reset(self, user_id):
         with self.db:
+            self.knowledge.reset(user_id)
             self.db.execute("DELETE FROM turn_sources WHERE user_id=?", (user_id,))
             self.db.execute("DELETE FROM turns WHERE user_id=?", (user_id,))
             self.db.execute("DELETE FROM archive_search WHERE user_id=?", (user_id,))

@@ -148,6 +148,15 @@ def create_app(settings, archiver=None, *, metrics=None, history=None):
         archiver.wakeup.set()
         return {"ok": True}
 
+    @app.get("/api/dialogs/{dialog_id}/memory")
+    async def person_memory(dialog_id: int):
+        if history is None:
+            raise HTTPException(409, "Память доступна при запущенном помощнике.")
+        return {
+            "facts": history.knowledge.facts(dialog_id, limit=100),
+            "text": history.knowledge.display(dialog_id),
+        }
+
     @app.get("/api/dialogs")
     async def dialogs(q: str = "", offset: int = 0):
         q = q[:200]

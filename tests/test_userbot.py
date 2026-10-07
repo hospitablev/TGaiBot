@@ -69,6 +69,18 @@ async def test_admin_only_accepts_owner_saved_messages(bot):
     bot.provider.answer.assert_not_awaited()
 
 
+async def test_natural_memory_controls_do_not_call_model(bot):
+    incoming = event("Что ты помнишь обо мне?")
+    await bot.handle(incoming)
+    assert incoming.reply.await_count == 1
+    forget = event("Забудь мой возраст", mid=2)
+    await bot.handle(forget)
+    assert "profile.age" in bot.history.knowledge.withdrawn(10)
+    assert bot.history.knowledge.withdrawn(11) == []
+    assert forget.reply.await_count == 1
+    bot.provider.answer.assert_not_awaited()
+
+
 async def test_deleted_message_during_generation_is_not_delivered(bot):
     async def answer(*args, **kwargs):
         assert bot.history.revise([1], 10) == {10}

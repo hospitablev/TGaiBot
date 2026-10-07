@@ -55,7 +55,7 @@ class Metrics:
         prompt, output, cached, written = tokens
         cost, complete = None, False
         estimate = None
-        if kind in {"model", "summary", "background"} and model == "claude-sonnet-5-5":
+        if kind in {"model", "summary", "background", "memory"} and model == "claude-sonnet-5-5":
             # USD per million: input .36, output 1.8, cache read .036, write .45.
             # Integer nanodollars avoid floating-point rounding of tiny charges.
             cost = output * 1800 if output is not None else 0
@@ -108,7 +108,7 @@ class Metrics:
             count(output_tokens) AS output_known, sum(output_tokens) AS output_tokens,
             count(cached_tokens) AS cached_known, sum(cached_tokens) AS cached_tokens,
             count(cache_write_tokens) AS written_known, sum(cache_write_tokens) AS written_tokens
-            FROM events WHERE created>=? AND kind IN ('model','summary','background')""",
+            FROM events WHERE created>=? AND kind IN ('model','summary','background','memory')""",
             (since,),
         ).fetchone()
 
@@ -133,7 +133,7 @@ class Metrics:
         cost_rows = self.db.execute(
             """SELECT kind,coalesce(sum(cost_nano),0) AS cost,
             sum(CASE WHEN cost_complete=1 THEN 0 ELSE 1 END) AS unknown
-            FROM events WHERE created>=? AND kind IN ('model','summary','background','image','voice')
+            FROM events WHERE created>=? AND kind IN ('model','summary','background','memory','image','voice')
             GROUP BY kind""",
             (since,),
         ).fetchall()
@@ -142,7 +142,7 @@ class Metrics:
         estimate = self.db.execute(
             "SELECT coalesce(sum(estimate_nano),0) FROM events WHERE created>=?", (since,)
         ).fetchone()[0]
-        model_cost = sum(costs.get(k, 0) for k in ("model", "summary", "background"))
+        model_cost = sum(costs.get(k, 0) for k in ("model", "summary", "background", "memory"))
         image_cost = costs.get("image", 0)
 
         def money(n):
@@ -152,6 +152,7 @@ class Metrics:
             f"Статистика {'за всё время' if all_time else 'за сегодня (UTC+05:00)'}\n\n"
             f"Запросов модели: {total}\n"
             f"Из них для сжатия: {counts.get('summary', {}).get('requests', 0)}\n"
+            f"Из них для карточек памяти: {counts.get('memory', {}).get('requests', 0)}\n"
             f"Из них фоновых: {counts.get('background', {}).get('requests', 0)}\n"
             f"Входных токенов: {tokens('input_tokens', 'input_known')}\n"
             f"Выходных токенов: {tokens('output_tokens', 'output_known')}\n"
@@ -183,7 +184,19 @@ def memory_report(history, settings):
     summaries, chars = db.execute(
         "SELECT count(*),coalesce(sum(length(content)),0) FROM summaries"
     ).fetchone()
+    facts = db.execute("SELECT count(*) FROM memory_facts WHERE status='active'").fetchone()[0]
+    conflicts = db.execute("SELECT count(*) FROM memory_facts WHERE status='conflict'").fetchone()[
+        0
+    ]
+    pending = db.execute("SELECT count(*) FROM memory_sources WHERE state='pending'").fetchone()[0]
+    failed = db.execute("SELECT count(*) FROM memory_sources WHERE state='failed'").fetchone()[0]
+    unconfirmed = db.execute(
+        "SELECT count(*) FROM memory_facts WHERE status='unconfirmed'"
+    ).fetchone()[0]
     return (
+        f"Карточки: {facts} активных фактов, {conflicts} противоречивых записей.\n"
+        f"Ожидают подтверждения из голосовых: {unconfirmed}.\n"
+        f"Очередь разбора: {pending}; не разобрано после 3 попыток: {failed}.\n\n"
         f"Память ИИ\n\nДиалогов: {users}\nСохранённых пар сообщений: {turns}\n"
         f"Резюме диалогов: {summaries}\nОбщий размер резюме: {chars} символов\n\n"
         f"Свежий контекст: до {settings.history_turns} пар и {settings.history_chars} символов\n"

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import sys
 import tempfile
 import time
@@ -40,6 +41,7 @@ HELP = (
     "• «В фоне сравни варианты поездки и сделай PDF» — займусь задачей отдельно от переписки.\n"
     "• «Что сделано?», «Статус задачи 3», «Отмени задачу 3» — управление фоновыми поручениями.\n"
     "• «Вспомни, что мы решили про поездку» — поищу в нашей переписке.\n"
+    "• «Покажи память» — покажу сохранённые сведения; «Забудь мой возраст» — уберу это поле.\n"
     "• «Забудь нашу переписку» — очищу память ИИ; сообщения в Telegram и личном архиве владельца останутся.\n"
     "• «Не отвечай мне» — остановлюсь; «Давай продолжим» — снова буду отвечать.\n\n"
     "Фото и файлы — до 20 МБ, видео и голосовые — до трёх минут. "
@@ -207,6 +209,8 @@ class Userbot:
         self.memory = Memory(settings, history, provider)
         self.images = images
         self.agent = agent
+        if self.agent:
+            self.agent.memory = self.memory
 
     async def reply(self, event, text):
         for part, entities in formatted_chunks(text):
@@ -393,6 +397,66 @@ class Userbot:
                     "Я очистил память ИИ о нашей переписке. Сообщения в Telegram и личном архиве владельца остались.",
                 )
             return
+        if command == "/my_memory":
+            if self.history.reserve_control(user_id):
+                await self.reply(event, self.history.knowledge.display(user_id))
+            return
+        if command == "/memory_retry":
+            if self.history.reserve_control(user_id):
+                with self.history.db:
+                    count = self.history.db.execute(
+                        "UPDATE memory_sources SET state='pending',attempts=0,retry_at=0 WHERE user_id=? AND state='failed'",
+                        (user_id,),
+                    ).rowcount
+                self.memory.wakeup.set()
+                await self.reply(
+                    event,
+                    f"Вернул на разбор сообщений: {count}."
+                    if count
+                    else "Неудачных разборов нет. Новые сведения сохраняются автоматически.",
+                )
+            return
+        confirmed = re.fullmatch(r"(?:/confirm|подтверди факт)\s+#?(\d+)[.!?]?", text.strip(), re.I)
+        if confirmed:
+            if self.history.reserve_control(user_id):
+                try:
+                    self.history.knowledge.confirm(user_id, int(confirmed[1]), event.id)
+                    await self.reply(event, "Подтверждение сохранено. Буду учитывать это сведение.")
+                except ValueError as exc:
+                    await self.reply(event, str(exc))
+            return
+        forgotten = re.fullmatch(
+            r"(?:/forget|забудь факт|удали факт)\s+#?(\d+)[.!?]?", text.strip(), re.I
+        )
+        forgotten_field = re.fullmatch(
+            r"(?:забудь|удали из памяти)\s+(?:мо[йюеё]\s+)?(возраст|имя|фамилию|дату рождения|город)[.!?]?",
+            text.strip(),
+            re.I,
+        )
+        if forgotten or forgotten_field:
+            if not self.history.reserve_control(user_id):
+                return
+            try:
+                if forgotten:
+                    self.history.knowledge.forget(user_id, int(forgotten[1]), self.history)
+                else:
+                    field = {
+                        "возраст": "age",
+                        "имя": "first_name",
+                        "фамилию": "last_name",
+                        "дату рождения": "birth_date",
+                        "город": "city",
+                    }[forgotten_field[1].lower()]
+                    self.history.knowledge.forget_slot(user_id, "profile." + field, self.history)
+                if tasks:
+                    await tasks.invalidate_context(user_id)
+                await self.reply(
+                    event,
+                    "Убрал факт и связанные фрагменты рабочей памяти. Старые разговоры больше не использую для восстановления забытого; остальные отдельные сведения продолжаю учитывать. Личный архив владельца остался.",
+                )
+            except ValueError as exc:
+                await self.reply(event, str(exc))
+            return
         if command == "/ai_start":
             self.history.pause(user_id, False)
             if tasks:
@@ -474,6 +538,8 @@ class Userbot:
             if hasattr(self.client, "action")
             else nullcontext()
         )
+        for message in messages:
+            self.memory.enqueue(user_id, message)
         async with self.slots, activity:
             try:
                 prompt = image_prompt(text)
@@ -531,6 +597,8 @@ class Userbot:
                             path = await self.download(message, Path(temp) / str(index))
                             self.history.archive_attachment(user_id, message.id, path)
                             part = await prepare_isolated(path, self.settings)
+                            if self.history.epoch(user_id) == request_epoch:
+                                self.memory.enqueue_voice(user_id, message, part)
                             combined.text += "\n" + part.text
                             combined.images.extend(part.images)
                             combined.notes.extend(part.notes)
@@ -633,6 +701,7 @@ async def run(settings):
     web_server = None
     web_task = None
     task_manager = None
+    memory = None
     try:
         await client.connect()
         if not await client.is_user_authorized():
@@ -703,6 +772,8 @@ async def run(settings):
         task_manager = TaskManager(settings, bot.agent, history)
         bot.agent.tasks = task_manager
         task_manager.start()
+        memory = bot.memory
+        memory.start()
         if settings.enable_calls:
             from .calls import CallBridge, call_readiness
 
@@ -773,6 +844,8 @@ async def run(settings):
             await calls.close()
         if task_manager:
             await task_manager.close()
+        if memory:
+            await memory.close()
         await client.disconnect()
         await archiver.close()
         archive.close()

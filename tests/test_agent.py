@@ -60,6 +60,20 @@ async def test_unknown_tool_or_cross_chat_parameter_cannot_send(agent):
     agent.client.send_file.assert_not_awaited()
 
 
+async def test_memory_tool_scopes_search_to_requester(agent):
+    from unittest.mock import Mock
+
+    agent.memory = SimpleNamespace(search=Mock(return_value={"facts": []}))
+    agent.provider.step.side_effect = [
+        response(call("search_memory", {"query": "имя", "user_id": 99})),
+        response(call("search_memory", {"query": "имя"}, "2")),
+        {"content": "Сведений нет"},
+    ]
+    await agent.answer([], 45, 123)
+    agent.memory.search.assert_called_once_with(45, "имя")
+    agent.client.send_file.assert_not_awaited()
+
+
 async def test_location_requires_search_and_uses_verified_coordinates(agent):
     place = {
         "name": "Алматы",
