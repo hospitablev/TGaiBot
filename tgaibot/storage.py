@@ -35,10 +35,19 @@ class History:
             created REAL NOT NULL, content TEXT NOT NULL,
             UNIQUE(user_id, message_id))""")
         self.db.execute("CREATE INDEX IF NOT EXISTS turns_user ON turns(user_id, id)")
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS turn_sources (turn_id INTEGER, user_id INTEGER, message_id INTEGER, PRIMARY KEY(turn_id,message_id))"
+        )
+        self.db.execute(
+            "INSERT OR IGNORE INTO turn_sources SELECT id,user_id,message_id FROM turns"
+        )
         self.db.execute("""CREATE TABLE IF NOT EXISTS processed (
             user_id INTEGER NOT NULL, message_id INTEGER NOT NULL, created REAL NOT NULL,
             PRIMARY KEY(user_id,message_id))""")
         self.db.execute("CREATE TABLE IF NOT EXISTS paused (user_id INTEGER PRIMARY KEY)")
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS changed_messages (user_id INTEGER, message_id INTEGER, PRIMARY KEY(user_id,message_id))"
+        )
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS voice (user_id INTEGER PRIMARY KEY, enabled INTEGER)"
         )
@@ -181,7 +190,7 @@ class History:
             (user_id, row_id, text),
         )
 
-    def add(self, user_id, message_id, content, answer):
+    def add(self, user_id, message_id, content, answer, source_ids=None):
         raw = json.dumps(
             [{"role": "user", "content": content}, {"role": "assistant", "content": answer}],
             ensure_ascii=False,
@@ -193,6 +202,62 @@ class History:
             )
             if result.rowcount:
                 self.index_turn(result.lastrowid, user_id, raw)
+                self.db.executemany(
+                    "INSERT OR IGNORE INTO turn_sources VALUES(?,?,?)",
+                    [(result.lastrowid, user_id, mid) for mid in (source_ids or [message_id])],
+                )
+
+    def revise(self, message_ids, user_id=None, *, replacement=None):
+        """Invalidate derived AI memory; the owner's separate archive keeps originals."""
+        affected = set()
+        with self.db:
+            for mid in message_ids:
+                self.db.execute(
+                    "INSERT OR IGNORE INTO changed_messages VALUES(?,?)", (user_id or 0, mid)
+                )
+                rows = self.db.execute(
+                    "SELECT user_id FROM inbox WHERE message_id=? AND (? IS NULL OR user_id=?)",
+                    (mid, user_id, user_id),
+                ).fetchall()
+                for (uid,) in rows:
+                    affected.add(uid)
+                    turns = self.db.execute(
+                        "SELECT turn_id FROM turn_sources WHERE user_id=? AND message_id=?",
+                        (uid, mid),
+                    ).fetchall()
+                    for (turn_id,) in turns:
+                        source_count = self.db.execute(
+                            "SELECT count(*) FROM turn_sources WHERE turn_id=?", (turn_id,)
+                        ).fetchone()[0]
+                        content = (
+                            "[Сообщение исправлено. Текущий текст:]\n" + replacement
+                            if replacement is not None and source_count == 1
+                            else "[Сообщение или часть альбома удалены либо изменены. Прежнее содержимое и ответ на него больше не актуальны.]"
+                        )
+                        raw = json.dumps([{"role": "user", "content": content}], ensure_ascii=False)
+                        self.db.execute("UPDATE turns SET content=? WHERE id=?", (raw, turn_id))
+                        self.db.execute("DELETE FROM archive_search WHERE turn_id=?", (turn_id,))
+                        self.index_turn(turn_id, uid, raw)
+                    self.db.execute(
+                        "UPDATE inbox SET text=? WHERE user_id=? AND message_id=?",
+                        (replacement or "[Удалено]", uid, mid),
+                    )
+            for uid in affected:
+                self.db.execute("DELETE FROM summaries WHERE user_id=?", (uid,))
+                self.db.execute(
+                    "INSERT INTO epochs VALUES(?,1) ON CONFLICT(user_id) DO UPDATE SET epoch=epoch+1",
+                    (uid,),
+                )
+        return affected
+
+    def changed(self, user_id, message_id):
+        return (
+            self.db.execute(
+                "SELECT 1 FROM changed_messages WHERE message_id=? AND user_id IN (0,?)",
+                (message_id, user_id),
+            ).fetchone()
+            is not None
+        )
 
     def archive_incoming(self, user_id, message):
         metadata = {
@@ -248,6 +313,7 @@ class History:
 
     def reset(self, user_id):
         with self.db:
+            self.db.execute("DELETE FROM turn_sources WHERE user_id=?", (user_id,))
             self.db.execute("DELETE FROM turns WHERE user_id=?", (user_id,))
             self.db.execute("DELETE FROM archive_search WHERE user_id=?", (user_id,))
             self.db.execute("DELETE FROM inbox WHERE user_id=?", (user_id,))

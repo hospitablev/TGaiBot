@@ -244,8 +244,12 @@ class Agent:
         )
 
     async def execute(self, name, args, directory, user_id, reply_to, places, is_current):
+        metrics = getattr(self.provider, "metrics", None)
         if name == "search_web":
-            return await self.search.web(**args)
+            result = await self.search.web(**args)
+            if metrics:
+                metrics.record("search")
+            return result
         if name == "search_places":
             result = await self.search.places(**args)
             # Copies keep per-request IDs out of the shared search cache.
@@ -254,6 +258,8 @@ class Agent:
                 identifier = f"place-{len(places) + 1}"
                 place["place_id"] = identifier
                 places[identifier] = place
+            if metrics:
+                metrics.record("search")
             return result
         if not is_current():
             raise ValueError("Запрос отменён после очистки памяти.")
@@ -266,6 +272,8 @@ class Agent:
                 InputMediaGeoPoint(InputGeoPoint(lat=place["latitude"], long=place["longitude"])),
                 reply_to=reply_to,
             )
+            if metrics:
+                metrics.record("location")
             return {
                 "sent": "геолокация «" + place["name"] + "»",
                 "url": place["url"],
@@ -289,8 +297,10 @@ class Agent:
             user_id,
             str(path),
             force_document=True,
-            caption="[ИИ-ассистент] " + path.name,
+            caption=path.name,
             parse_mode=None,
             reply_to=reply_to,
         )
+        if metrics:
+            metrics.record("file")
         return {"sent": "файл «" + path.name + "»", "filename": path.name}

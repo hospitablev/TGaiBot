@@ -59,6 +59,15 @@ def reopen(manager):
     manager.store = TaskStore(manager.settings)
 
 
+async def test_changed_chat_stops_saved_tasks_without_affecting_other_user(manager):
+    task = create(manager)
+    other = create(manager, user=20)
+    await manager.invalidate_context(10)
+    assert manager.store.get(10, task)["status"] == "cancelled"
+    assert manager.store.get(20, other)["status"] == "queued"
+    manager.agent.provider.step.assert_not_awaited()
+
+
 async def test_background_plan_action_completion_and_notification(manager):
     task_id = create(manager)
     manager.agent.provider.step.side_effect = [
@@ -174,7 +183,7 @@ async def test_clarification_resumes_same_task_with_new_instruction(manager):
 async def test_cancel_running_task_and_query_status_during_work(manager):
     started = asyncio.Event()
 
-    async def slow(*args):
+    async def slow(*args, **kwargs):
         started.set()
         await asyncio.Event().wait()
 
@@ -321,7 +330,7 @@ async def test_telegram_background_ack_status_and_cancel_need_no_model(manager):
 async def test_reset_does_not_start_next_queued_task_for_same_user(manager):
     started = asyncio.Event()
 
-    async def slow(*args):
+    async def slow(*args, **kwargs):
         started.set()
         await asyncio.Event().wait()
 

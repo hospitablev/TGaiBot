@@ -16,13 +16,14 @@ def speech_text(text, limit=1500):
     text = spoken_markdown(text)
     truncated = len(text) > limit
     if truncated:
-        text = text[:limit].rsplit(" ", 1)[0] + ". Продолжение — в текстовом ответе."
-    return "Отвечает искусственный интеллект. " + text, truncated
+        text = text[:limit].rsplit(" ", 1)[0] + ". Продолжение в текстовом ответе."
+    return text, truncated
 
 
 class FishTTS:
-    def __init__(self, settings, client=None):
+    def __init__(self, settings, client=None, metrics=None):
         self.settings = settings
+        self.metrics = metrics
         self.client = client or httpx.AsyncClient(
             timeout=httpx.Timeout(45, connect=10), follow_redirects=False
         )
@@ -88,6 +89,8 @@ class FishTTS:
         except TTSError:
             target.unlink(missing_ok=True)
             raise
+        if self.metrics:
+            self.metrics.record("voice", model=self.settings.fish_model)
         return target
 
     async def voice_note(self, text, directory):

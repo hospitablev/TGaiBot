@@ -14,6 +14,18 @@ from telethon.tl.types import (
 from tgaibot.formatting import formatted_chunks, plain_fallback, render, spoken_markdown
 
 
+def test_dash_cleanup_preserves_code_quotes_and_entity_offsets():
+    text, entities = next(formatted_chunks("**Привет — 🙂**\n\n`x—y`\n\n> Точная цитата — здесь"))
+    assert "Привет - 🙂" in text
+    assert "x—y" in text and "цитата — здесь" in text
+    bold = next(e for e in entities if isinstance(e, MessageEntityBold))
+    from telethon.helpers import add_surrogate, del_surrogate
+
+    assert (
+        del_surrogate(add_surrogate(text)[bold.offset : bold.offset + bold.length]) == "Привет - 🙂"
+    )
+
+
 def test_markdown_features():
     text, entities = render(
         "**Жирный** *курсив* [ссылка](https://example.com)\n\n- один\n- два\n\n```python\nprint('hi')\n```"

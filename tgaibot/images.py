@@ -29,8 +29,9 @@ def image_prompt(text):
 
 
 class ImageGenerator:
-    def __init__(self, settings, client=None):
+    def __init__(self, settings, client=None, metrics=None):
         self.settings = settings
+        self.metrics = metrics
         self.client = client or httpx.AsyncClient(
             timeout=httpx.Timeout(180, connect=15), follow_redirects=False
         )
@@ -85,6 +86,8 @@ class ImageGenerator:
                 decoded.verify()
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(image)
+            if self.metrics:
+                self.metrics.record("image", model=IMAGE_MODEL)
             return target
         except (httpx.HTTPError, TimeoutError):
             raise ProviderError("Генератор изображений недоступен или не ответил за 180 секунд.")

@@ -81,6 +81,13 @@ def test_deletions_mark_but_do_not_erase_original(archive):
     assert row["deleted"] == 1 and row["text"] == "Привет"
 
 
+def test_delete_before_history_import_still_keeps_original_marked(archive):
+    archive.deleted([1])
+    archive.capture(10, "Анна", None, message())
+    row = archive.db.execute("SELECT * FROM messages").fetchone()
+    assert row["deleted"] == 1 and row["text"] == "Привет"
+
+
 def test_repeated_capture_does_not_requeue_saved_file(archive):
     value = message(
         file=SimpleNamespace(size=12, name="x.ogg", mime_type="audio/ogg"),
@@ -168,6 +175,7 @@ async def test_viewer_requires_password_on_all_data_routes(web):
     for path in [
         "/api/dialogs",
         "/api/status",
+        "/api/metrics",
         "/api/dialogs/10/messages",
         "/api/media/10/1",
         "/api/dialogs/10/messages/1/details",
@@ -214,6 +222,10 @@ async def test_media_ranges_and_html_download_safety(web, archive):
     await login(web)
     response = await web.get("/api/media/10/1", headers={"Range": "bytes=2-5"})
     assert response.status_code == 206 and response.content == b"2345"
+    archive.deleted([1], 10)
+    assert (await web.get("/api/media/10/1")).content == b"0123456789"
+    rows = (await web.get("/api/dialogs/10/messages")).json()
+    assert rows[0]["deleted"] == 1 and rows[0]["text"] == "Привет"
     archive.db.execute("UPDATE messages SET mime='text/html',filename='attack.html'")
     archive.db.commit()
     response = await web.get("/api/media/10/1")

@@ -31,7 +31,7 @@ async def test_summary_updates_and_fresh_context_stays_verbatim(settings, histor
     assert context[-2]["content"] == "Мой проект Орион, задача 35"
     assert len([m for m in context if m["role"] == "assistant"]) == 24
     assert history.db.execute("SELECT count(*) FROM turns").fetchone()[0] == 36
-    assert "не всю старую переписку" in notice
+    assert notice == ""
 
 
 async def test_memory_isolation_and_explicit_corrections(settings, history):
@@ -101,3 +101,32 @@ async def test_oversized_summary_rejected(settings, history):
     )
     await Memory(settings, history, provider).context(1, "продолжай")
     assert history.summary(1) == (0, {})
+
+
+async def test_bad_summary_backoff_does_not_charge_every_message(settings, history):
+    seed(history)
+    provider = SimpleNamespace(answer=AsyncMock(return_value="invalid"))
+    memory = Memory(settings, history, provider)
+    await memory.context(1, "продолжай")
+    context, notice = await memory.context(1, "а дальше?")
+    assert provider.answer.await_count == 1
+    assert notice == ""
+    assert context[-1]["content"] == "Обсудили шаг 35"
+
+
+def test_edit_and_album_delete_invalidate_summary_but_keep_other_chat(history):
+    from datetime import datetime, timezone
+
+    for mid in (1, 2):
+        history.archive_incoming(
+            1, SimpleNamespace(id=mid, date=datetime.now(timezone.utc), message="старый секрет")
+        )
+    history.add(1, 1, "старый секрет", "ответ", source_ids=[1, 2])
+    history.add(2, 1, "другой диалог", "ответ")
+    history.save_summary(1, 1, summary(user_claims=["старый секрет"]), 0)
+    assert history.revise([2], 1) == {1}
+    assert history.summary(1) == (0, {})
+    assert history.epoch(1) == 1
+    assert "старый секрет" not in json.dumps(history.messages(1), ensure_ascii=False)
+    assert history.retrieve(1, "секрет") == []
+    assert history.messages(2)[0]["content"] == "другой диалог"

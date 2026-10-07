@@ -56,6 +56,6 @@ async def test_missing_key_no_request(settings, tmp_path):
 
 def test_speech_disclosure_code_and_truncation():
     text, truncated = speech_text("Пример ```python\nsecret_code()\n``` " + "слово " * 1000)
-    assert text.startswith("Отвечает искусственный интеллект.")
+    assert text.startswith("Пример")
     assert "secret_code" not in text and truncated
     assert "Продолжение" in text

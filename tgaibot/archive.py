@@ -47,6 +47,8 @@ class Archive:
             CREATE INDEX IF NOT EXISTS message_jobs ON messages(status,retry_at);
             CREATE TABLE IF NOT EXISTS revisions (
                 dialog_id INTEGER, message_id INTEGER, observed REAL, text TEXT, metadata TEXT);
+            CREATE TABLE IF NOT EXISTS deletions (
+                dialog_id INTEGER, message_id INTEGER, PRIMARY KEY(dialog_id,message_id));
             CREATE TABLE IF NOT EXISTS sync_state (
                 dialog_id INTEGER PRIMARY KEY, high_water INTEGER DEFAULT 0);
         """)
@@ -123,7 +125,14 @@ class Archive:
                 getattr(message, "reply_to_msg_id", None),
                 str(getattr(message, "grouped_id", "") or ""),
                 edit.timestamp() if edit else None,
-                old["deleted"] if old else 0,
+                int(
+                    bool(old and old["deleted"])
+                    or self.db.execute(
+                        "SELECT 1 FROM deletions WHERE message_id=? AND dialog_id IN (0,?)",
+                        (message.id, chat_id),
+                    ).fetchone()
+                    is not None
+                ),
                 metadata,
                 media_key,
                 relative_path,
@@ -140,6 +149,7 @@ class Archive:
     def deleted(self, ids, chat_id=None):
         with self.db:
             for mid in ids:
+                self.db.execute("INSERT OR IGNORE INTO deletions VALUES(?,?)", (chat_id or 0, mid))
                 if chat_id is None:
                     self.db.execute("UPDATE messages SET deleted=1 WHERE id=?", (mid,))
                 else:

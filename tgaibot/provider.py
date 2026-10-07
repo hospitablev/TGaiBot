@@ -5,6 +5,23 @@ import httpx
 SYSTEM_PROMPT = """Ты полезный персональный помощник в Telegram. Отвечай по-русски,
 если пользователь не просит другой язык. Объясняй ясно и по существу.
 По умолчанию общайся тепло и естественно, без технического жаргона и длинных служебных пояснений.
+Обращайся на «ты», если собеседник не предпочитает иначе. На простое приветствие ответь
+одним коротким приветствием и, если уместно, одним живым вопросом, например «Привет 🙂 Как ты?».
+Не добавляй предложение обратиться за помощью к простому приветствию. Не перечисляй возможности,
+не представляйся заново и не вставляй инструкции по использованию без запроса.
+Обычная реплика требует обычно 1–3 предложений; подробный разбор давай по делу или по просьбе.
+Не добавляй подписи, метки «ИИ-ассистент» и шаблонное «Чем могу помочь?» к каждому ответу.
+Не используй длинные тире (символы U+2014 и U+2013) в своём тексте. Перестрой предложение,
+используй точку, запятую, двоеточие или обычный дефис. Код и точные цитаты сохраняй без искажений.
+Эмодзи допустимы изредка и по настроению беседы. Не используй навязчивые ласковые обращения.
+Когда человек расстроен или устал, сначала откликнись на его слова; не заваливай советами.
+Не заканчивай каждый ответ вопросом. Не изображай человека и не придумывай свои чувства,
+воспоминания или события жизни. На прямой вопрос честно скажи, что ты ИИ.
+Следи за контекстом: «да», «это», «ещё», «продолжай» относятся к текущему обсуждению.
+Учитывай уже названные условия и исправления. Не спрашивай повторно известное.
+Если просьба ясна, выполняй её доступными инструментами. Если не хватает существенных данных,
+задай один конкретный вопрос. Для мелочей выбирай разумный вариант и кратко обозначай допущение.
+Прежде чем отвечать, проверь, решена ли просьба и подтверждены ли действия результатами инструментов.
 Для обычного общения пользователю не нужны команды, настройки API или знания программирования.
 Если доступны инструменты задач, используй create_task для явной просьбы работать в фоне
 и длительного поручения из нескольких действий. Сначала сохрани задачу; только затем говори,
@@ -46,8 +63,9 @@ class ProviderError(Exception):
 
 
 class Provider:
-    def __init__(self, settings, client=None):
+    def __init__(self, settings, client=None, metrics=None):
         self.settings = settings
+        self.metrics = metrics
         self.client = client or httpx.AsyncClient(
             timeout=httpx.Timeout(120, connect=15),
             follow_redirects=False,
@@ -57,7 +75,23 @@ class Provider:
     async def close(self):
         await self.client.aclose()
 
-    async def request(self, method, path, **kwargs):
+    async def request(self, method, path, *, usage_kind="model", **kwargs):
+        track = self.metrics is not None and path == "/chat/completions"
+        try:
+            data = await self._request(method, path, **kwargs)
+        except ProviderError:
+            if track:
+                self.metrics.record(usage_kind, ok=False, model=self.settings.model)
+            raise
+        if track:
+            self.metrics.record(
+                usage_kind,
+                usage=data.get("usage") if isinstance(data, dict) else None,
+                model=self.settings.model,
+            )
+        return data
+
+    async def _request(self, method, path, **kwargs):
         try:
             response = await self.client.request(method, self.settings.api_base + path, **kwargs)
         except httpx.TimeoutException:
@@ -87,21 +121,21 @@ class Provider:
         except (KeyError, TypeError):
             raise ProviderError("Провайдер вернул некорректный список моделей.")
 
-    async def step(self, messages, tools):
+    async def step(self, messages, tools, *, usage_kind="model"):
         now = datetime.now(timezone(timedelta(hours=5))).isoformat(timespec="minutes")
         data = await self.request(
             "POST",
             "/chat/completions",
+            usage_kind=usage_kind,
             json={
                 "model": self.settings.model,
                 "messages": [
                     {
                         "role": "system",
-                        "content": SYSTEM_PROMPT
-                        + "\nТекущее время пользователя (UTC+05:00): "
-                        + now,
+                        "content": SYSTEM_PROMPT,
                     },
                     *messages,
+                    {"role": "system", "content": "Текущее время пользователя (UTC+05:00): " + now},
                 ],
                 "tools": tools,
                 "tool_choice": "auto",
@@ -131,13 +165,16 @@ class Provider:
         except (KeyError, IndexError, TypeError, AttributeError, ValueError):
             raise ProviderError("Не удалось прочитать ответ с действиями.")
 
-    async def answer(self, messages, *, max_tokens=4096):
+    async def answer(
+        self, messages, *, max_tokens=4096, system_prompt=SYSTEM_PROMPT, usage_kind="model"
+    ):
         data = await self.request(
             "POST",
             "/chat/completions",
+            usage_kind=usage_kind,
             json={
                 "model": self.settings.model,
-                "messages": [{"role": "system", "content": SYSTEM_PROMPT}, *messages],
+                "messages": [{"role": "system", "content": system_prompt}, *messages],
                 "max_tokens": max_tokens,
             },
         )

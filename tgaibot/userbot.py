@@ -26,7 +26,6 @@ from .tts import FishTTS, TTSError
 from .worker import prepare_isolated
 
 LOG = logging.getLogger(__name__)
-PREFIX = "[ИИ-ассистент] "
 HELP = (
     "Просто пиши мне, как в обычной переписке. Я ИИ-помощник: могу объяснить непонятное, "
     "обсудить идею, помочь с текстом или разобраться в фото, документе и коротком видео.\n\n"
@@ -228,6 +227,37 @@ class Userbot:
                 for fallback in chunks(plain_fallback(part, entities)):
                     await event.reply(fallback, parse_mode=None, link_preview=False)
 
+    async def admin(self, event):
+        # Saved Messages only: neither prompts nor another chat can grant admin access.
+        if not (
+            event.is_private
+            and event.out
+            and event.sender_id == self.self_id
+            and event.chat_id == self.self_id
+            and event.message.date >= self.started
+        ):
+            return
+        text = (event.raw_text or "").strip().lower()
+        if text not in {"/admin", "/stats", "/stats all", "/memory"}:
+            return
+        if self.history.seen(self.self_id, event.id):
+            return
+        self.history.mark_seen(self.self_id, event.id)
+        from .metrics import memory_report
+
+        if text == "/admin":
+            answer = "Команды владельца в Избранном:\n/stats: статистика и расходы за сегодня\n/stats all: за всё время\n/memory: состояние памяти"
+        elif text == "/memory":
+            answer = memory_report(self.history, self.settings)
+        else:
+            metrics = getattr(self.provider, "metrics", None)
+            answer = (
+                metrics.report(all_time=text.endswith(" all"))
+                if metrics
+                else "Учёт пока не включён."
+            )
+        await self.reply(event, answer)
+
     async def eligible(self, event):
         if (
             not event.is_private
@@ -332,6 +362,9 @@ class Userbot:
 
     async def process(self, event, messages):
         user_id = event.sender_id
+        request_epoch = self.history.epoch(user_id)
+        if any(self.history.changed(user_id, message.id) for message in messages):
+            return
         if self.history.seen(user_id, event.id):
             return
         for message in messages:
@@ -459,6 +492,8 @@ class Userbot:
                         / f"generated-{event.id}.png"
                     )
                     generated = await self.images.generate(prompt, target)
+                    if self.history.epoch(user_id) != request_epoch:
+                        return
                     content = [
                         {
                             "type": "text",
@@ -475,7 +510,7 @@ class Userbot:
                         user_id,
                         str(generated),
                         force_document=False,
-                        caption=PREFIX + "Картинка готова ✨",
+                        caption="Картинка готова ✨",
                         parse_mode=None,
                         reply_to=event.id,
                     )
@@ -510,8 +545,12 @@ class Userbot:
                             "Вложений слишком много: отправьте их по одному "
                             "(до 16 изображений и 45000 символов на запрос)."
                         )
-                    epoch = self.history.epoch(user_id)
+                    epoch = request_epoch
+                    if self.history.epoch(user_id) != epoch:
+                        return
                     history, memory_notice = await self.memory.context(user_id, content)
+                    if self.history.epoch(user_id) != epoch:
+                        return
                     model_messages = [*history, {"role": "user", "content": content}]
                     background = background_request(text)
                     if background and tasks:
@@ -535,16 +574,12 @@ class Userbot:
                         answer = await self.provider.answer(model_messages)
                     if self.history.epoch(user_id) != epoch:
                         return
-                    self.history.add(user_id, event.id, content, answer)
+                    self.history.add(
+                        user_id, event.id, content, answer, source_ids=[m.id for m in messages]
+                    )
                     notice = "\n\n".join(dict.fromkeys(combined.notes))
                     if memory_notice:
                         notice += "\n\n" + memory_notice
-                    if not history:
-                        notice = (
-                            "Я ИИ-помощник. Можно просто писать, присылать фото и голосовые. "
-                            "Если хочешь голосовой ответ, скажи «Отвечай голосом». "
-                            "Материалы обрабатываются внешними ИИ-сервисами.\n\n" + notice
-                        )
                     await self.reply(
                         event, (notice.strip() + "\n\n" if notice.strip() else "") + answer
                     )
@@ -556,7 +591,9 @@ class Userbot:
                     if self.tts and wants_voice and self.settings.voice_replies != "off":
                         try:
                             voice, truncated = await self.tts.voice_note(answer, Path(temp))
-                            caption = PREFIX + "Озвучка Fish Audio"
+                            if self.history.epoch(user_id) != epoch:
+                                return
+                            caption = "Голосовой ответ"
                             if truncated:
                                 caption += "; прочитано начало, полный ответ выше."
                             await self.client.send_file(
@@ -578,12 +615,15 @@ class Userbot:
 
 
 async def run(settings):
+    from .metrics import Metrics
+
+    metrics = Metrics(settings.data_dir)
     client = make_client(settings)
     provider, history, tts, images = (
-        Provider(settings),
+        Provider(settings, metrics=metrics),
         History(settings),
-        FishTTS(settings),
-        ImageGenerator(settings),
+        FishTTS(settings, metrics=metrics),
+        ImageGenerator(settings, metrics=metrics),
     )
     maintenance = None
     calls = None
@@ -611,10 +651,24 @@ async def run(settings):
         @client.on(events.MessageEdited())
         async def archive_edit(event):
             await archiver.observe(event)
+            if event.is_private and not event.out:
+                affected = history.revise(
+                    [event.id],
+                    event.chat_id,
+                    replacement=event.raw_text
+                    or "[Вложение изменено; прежнее описание не актуально]",
+                )
+                if task_manager:
+                    for uid in affected:
+                        await task_manager.invalidate_context(uid)
 
         @client.on(events.MessageDeleted())
         async def archive_delete(event):
             archive.deleted(event.deleted_ids, event.chat_id)
+            affected = history.revise(event.deleted_ids, event.chat_id)
+            if task_manager:
+                for uid in affected:
+                    await task_manager.invalidate_context(uid)
 
         archiver.start()
         if settings.archive_password:
@@ -626,7 +680,7 @@ async def run(settings):
 
             web_server = uvicorn.Server(
                 uvicorn.Config(
-                    create_app(settings, archiver),
+                    create_app(settings, archiver, metrics=metrics, history=history),
                     host="0.0.0.0" if os.getenv("RAILWAY_ENVIRONMENT_ID") else "127.0.0.1",
                     port=settings.archive_port,
                     log_level="warning",
@@ -670,6 +724,10 @@ async def run(settings):
         async def incoming(event):
             if not event.grouped_id:
                 await bot.handle(event)
+
+        @client.on(events.NewMessage(outgoing=True))
+        async def admin_message(event):
+            await bot.admin(event)
 
         @client.on(events.Album())
         async def album(event):
@@ -723,3 +781,4 @@ async def run(settings):
         await images.close()
         await search.close()
         history.close()
+        metrics.close()

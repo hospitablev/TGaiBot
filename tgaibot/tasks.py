@@ -299,6 +299,31 @@ class TaskManager:
             self.store.forget(user_id)
         self.blocked_users.discard(user_id)
 
+    async def invalidate_context(self, user_id):
+        # A saved task includes a snapshot of its chat. Do not act on withdrawn instructions.
+        self.blocked_users.add(user_id)
+        try:
+            rows = self.store.db.execute(
+                "SELECT id FROM tasks WHERE user_id=? AND status IN ('queued','running','needs_input')",
+                (user_id,),
+            ).fetchall()
+            for row in rows:
+                await self.cancel(user_id, row[0])
+                self.store.update(
+                    row[0],
+                    progress="Сообщения изменились; нужно новое поручение",
+                    result="Задача остановлена после удаления или изменения сообщения в диалоге. Уже отправленные результаты остаются.",
+                )
+            if self.delivery_user == user_id and self.delivery_task:
+                self.delivery_task.cancel()
+                await asyncio.gather(self.delivery_task, return_exceptions=True)
+            with self.store.db:
+                self.store.db.execute(
+                    "UPDATE tasks SET notification='none' WHERE user_id=?", (user_id,)
+                )
+        finally:
+            self.blocked_users.discard(user_id)
+
     def resume(self, user_id, task_id, instruction):
         row = self.store.get(user_id, task_id)
         bounded_text(instruction, 4000)
@@ -435,7 +460,7 @@ class TaskManager:
                     "content": "Ты выполняешь сохранённую фоновую задачу. Сначала сохрани короткий план через task_plan, затем выполняй его доступными инструментами. Не создавай новые фоновые задачи. Действия только в этом чате. План не означает выполнение. Уточнения запрашивай через finish_task(status=needs_input). По завершении проверь результаты инструментов и вызови finish_task(status=completed, summary=конкретный итог со ссылками). Этот инструмент вызывается отдельно. Если не хватает возможностей, честно сообщи об этом. Не обещай будущую работу после завершения.",
                 }
                 response = await self.agent.provider.step(
-                    [instruction, *state["conversation"]], BACKGROUND_TOOLS
+                    [instruction, *state["conversation"]], BACKGROUND_TOOLS, usage_kind="background"
                 )
                 if not valid():
                     return

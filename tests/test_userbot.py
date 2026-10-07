@@ -9,7 +9,7 @@ from telethon.tl.types import MessageEntityBold
 
 from tgaibot.provider import ProviderError
 from tgaibot.tts import TTSError
-from tgaibot.userbot import PREFIX, Userbot, account_lock, chunks
+from tgaibot.userbot import Userbot, account_lock, chunks
 
 
 def event(text="Привет", *, user=10, mid=1, **kwargs):
@@ -46,15 +46,47 @@ def bot(settings, history):
     )
 
 
-async def test_inbound_reply_discloses_ai_and_deduplicates(bot):
+async def test_inbound_reply_is_direct_and_deduplicates(bot):
     incoming = event()
     await bot.handle(incoming)
     await bot.handle(incoming)
     assert bot.provider.answer.await_count == 1
-    assert incoming.reply.await_args.args[0].startswith(PREFIX)
-    assert "внешними ИИ-сервисами" in incoming.reply.await_args.args[0]
+    assert incoming.reply.await_args.args[0] == "Ответ"
     assert incoming.reply.await_args.kwargs["parse_mode"] is None
     assert len(bot.history.messages(10)) == 2
+
+
+async def test_admin_only_accepts_owner_saved_messages(bot):
+    for user, chat, outgoing in [(10, 99, False), (99, 10, True), (99, 99, False)]:
+        incoming = event("/memory", user=user, out=outgoing, chat_id=chat)
+        await bot.admin(incoming)
+        incoming.reply.assert_not_awaited()
+    incoming = event("/memory", user=99, out=True, chat_id=99)
+    await bot.admin(incoming)
+    await bot.admin(incoming)
+    incoming.reply.assert_awaited_once()
+    assert "Память ИИ" in incoming.reply.await_args.args[0]
+    bot.provider.answer.assert_not_awaited()
+
+
+async def test_deleted_message_during_generation_is_not_delivered(bot):
+    async def answer(*args, **kwargs):
+        assert bot.history.revise([1], 10) == {10}
+        return "Устаревший ответ"
+
+    bot.provider.answer.side_effect = answer
+    incoming = event()
+    await bot.handle(incoming)
+    incoming.reply.assert_not_awaited()
+    assert bot.history.messages(10) == []
+
+
+async def test_delete_arrives_before_queued_message_is_processed(bot):
+    bot.history.revise([1])
+    incoming = event()
+    await bot.handle(incoming)
+    incoming.reply.assert_not_awaited()
+    bot.provider.answer.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -118,7 +150,7 @@ def test_utf16_chunk_limits():
     original = "🙂" * 5000 + "Я" * 5000
     parts = list(chunks(original))
     assert "".join(parts) == original
-    assert all(len((PREFIX + part).encode("utf-16-le")) // 2 < 4096 for part in parts)
+    assert all(len(part.encode("utf-16-le")) // 2 < 4096 for part in parts)
 
 
 def test_single_instance_lock(tmp_path):

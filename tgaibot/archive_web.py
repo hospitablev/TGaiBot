@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 
-def create_app(settings, archiver=None):
+def create_app(settings, archiver=None, *, metrics=None, history=None):
     if len(settings.archive_password) < 16:
         raise RuntimeError("Для просмотра архива задайте ARCHIVE_PASSWORD (от 16 символов).")
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -124,6 +124,17 @@ def create_app(settings, archiver=None):
                 "sync_error": archiver.sync_error if archiver else None,
             }
         return result
+
+    @app.get("/api/metrics")
+    async def statistics(all_time: bool = False):
+        from .metrics import memory_report
+
+        if metrics is None:
+            raise HTTPException(409, "Учёт доступен при запущенном помощнике.")
+        return {
+            "report": metrics.report(all_time=all_time),
+            "memory": memory_report(history, settings) if history else "",
+        }
 
     @app.post("/api/sync")
     async def sync():

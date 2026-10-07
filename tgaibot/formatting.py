@@ -265,7 +265,7 @@ def _clip(entities, start, end, prefix_size, encoded):
     return spans
 
 
-def formatted_chunks(text, prefix="[ИИ-ассистент] ", limit=3500):
+def formatted_chunks(text, prefix="", limit=3500):
     prefix_size = len(add_surrogate(prefix))
     if limit > 4096 or limit - prefix_size < 2:
         raise ValueError("Chunk limit must fit prefix and Unicode text, and be <=4096")
@@ -274,6 +274,20 @@ def formatted_chunks(text, prefix="[ИИ-ассистент] ", limit=3500):
     except Exception:
         plain, entities = text, []
     encoded = add_surrogate(plain)
+    # One UTF-16 unit replaces one unit, so Telegram entity offsets stay valid.
+    protected = [
+        e
+        for e in entities
+        if isinstance(
+            e, (MessageEntityCode, MessageEntityPre, MessageEntityBlockquote, MessageEntityTextUrl)
+        )
+    ]
+    encoded = "".join(
+        "-"
+        if char in "—–" and not any(e.offset <= i < e.offset + e.length for e in protected)
+        else char
+        for i, char in enumerate(encoded)
+    )
     start = 0
     while start < len(encoded):
         end = min(len(encoded), start + limit - prefix_size)
