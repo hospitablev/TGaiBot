@@ -93,6 +93,34 @@ TOOLS = [
     ),
 ]
 SCHEMAS = {item["function"]["name"]: item["function"]["parameters"] for item in TOOLS}
+TASK_TOOLS = [
+    tool(
+        "create_task",
+        "Сохранить фоновую задачу по поручению пользователя. Применяй для явной просьбы работать в фоне или длительной многошаговой работы. Не создавай задачу для простого вопроса. Уточни недостающие обязательные сведения. delay_minutes=0 — начать сейчас; до 10080 — отложить. Итог придёт в этот же чат.",
+        {"title": STRING, "instruction": STRING, "delay_minutes": {"type": "integer"}},
+        ["title", "instruction", "delay_minutes"],
+    ),
+    tool("list_tasks", "Узнать реальные статусы фоновых задач этого собеседника.", {}, []),
+    tool(
+        "get_task",
+        "Узнать план, подтверждённые действия и итог задачи этого собеседника.",
+        {"task_id": {"type": "integer"}},
+        ["task_id"],
+    ),
+    tool(
+        "cancel_task",
+        "Отменить задачу по явной просьбе пользователя. Уже отправленные файлы остаются в чате.",
+        {"task_id": {"type": "integer"}},
+        ["task_id"],
+    ),
+    tool(
+        "resume_task",
+        "Продолжить задачу, которая ждёт уточнения; передай ответ пользователя.",
+        {"task_id": {"type": "integer"}, "instruction": STRING},
+        ["task_id", "instruction"],
+    ),
+]
+TASK_SCHEMAS = {item["function"]["name"]: item["function"]["parameters"] for item in TASK_TOOLS}
 
 
 def with_attribution(text, places):
@@ -106,6 +134,7 @@ def with_attribution(text, places):
 class Agent:
     def __init__(self, settings, provider, search, client):
         self.settings, self.provider, self.search, self.client = settings, provider, search, client
+        self.tasks = None
 
     async def answer(self, messages, user_id, reply_to, is_current=lambda: True):
         conversation = list(messages)
@@ -114,7 +143,9 @@ class Agent:
         count = 0
         try:
             for _ in range(5):
-                response = await self.provider.step(conversation, TOOLS)
+                response = await self.provider.step(
+                    conversation, TOOLS + TASK_TOOLS if self.tasks else TOOLS
+                )
                 if not is_current():
                     return "Запрос отменён после очистки памяти."
                 calls = response.get("tool_calls") or []
@@ -137,7 +168,9 @@ class Agent:
                             if not isinstance(raw, str) or len(raw) > 80000:
                                 raise ValueError("Слишком большой запрос действия.")
                             args = json.loads(raw)
-                            schema = SCHEMAS.get(name)
+                            schema = SCHEMAS.get(name) or (
+                                TASK_SCHEMAS.get(name) if self.tasks else None
+                            )
                             if (
                                 not schema
                                 or not isinstance(args, dict)
@@ -148,12 +181,30 @@ class Agent:
                             if key in executed:
                                 result = executed[key]
                             else:
-                                result = await self.execute(
-                                    name, args, directory, user_id, reply_to, places, is_current
-                                )
+                                if name in TASK_SCHEMAS and self.tasks:
+                                    if name == "create_task":
+                                        result = self.tasks.create(
+                                            user_id, reply_to, messages, **args
+                                        )
+                                    elif name == "list_tasks":
+                                        result = {"tasks": self.tasks.store.list(user_id)}
+                                    elif name == "get_task":
+                                        result = self.tasks.store.describe(user_id, **args)
+                                    elif name == "cancel_task":
+                                        result = await self.tasks.cancel(user_id, **args)
+                                    else:
+                                        result = self.tasks.resume(user_id, **args)
+                                else:
+                                    result = await self.execute(
+                                        name, args, directory, user_id, reply_to, places, is_current
+                                    )
                                 executed[key] = result
                                 if result.get("sent"):
                                     receipts.append(result["sent"])
+                                if result.get("created"):
+                                    receipts.append(
+                                        f"сохранена фоновая задача #{result['task_id']}"
+                                    )
                         except errors.RPCError:
                             # Never retry a Telegram send with an unknown delivery outcome.
                             raise

@@ -14,7 +14,7 @@ from telethon.sessions import StringSession
 
 from .agent import Agent
 from .archive import Archive, Archiver
-from .conversation import control_intent, simple_error
+from .conversation import background_request, control_intent, simple_error, task_control
 from .formatting import formatted_chunks, plain_fallback
 from .images import IMAGE_MODEL, ImageGenerator, image_prompt
 from .media import SUPPORTED_EXT, MediaError, Prepared, image_data
@@ -38,6 +38,8 @@ HELP = (
     "• «Сделай PDF с планом поездки» или «Сделай Excel с расходами» — пришлю файл.\n"
     "• «Найди в интернете…» — поищу и дам ссылки.\n"
     "• «Найди кафе в Алматы и пришли точку» — поищу на карте.\n"
+    "• «В фоне сравни варианты поездки и сделай PDF» — займусь задачей отдельно от переписки.\n"
+    "• «Что сделано?», «Статус задачи 3», «Отмени задачу 3» — управление фоновыми поручениями.\n"
     "• «Вспомни, что мы решили про поездку» — поищу в нашей переписке.\n"
     "• «Забудь нашу переписку» — очищу память ИИ; сообщения в Telegram и личном архиве владельца останутся.\n"
     "• «Не отвечай мне» — остановлюсь; «Давай продолжим» — снова буду отвечать.\n\n"
@@ -337,15 +339,20 @@ class Userbot:
             self.history.archive_incoming(user_id, message)
         text = event.raw_text or ""
         command = control_intent(text)
+        tasks = self.agent.tasks if self.agent else None
         if command == "/ai_stop":
             if not self.history.is_paused(user_id):
                 self.history.pause(user_id)
+                if tasks:
+                    await tasks.suspend(user_id)
                 await self.reply(
                     event,
                     "Хорошо, больше не буду отвечать. Когда захочешь вернуться, напиши «Давай продолжим».",
                 )
             return
         if command == "/ai_reset":
+            if tasks:
+                await tasks.suspend(user_id, forget=True)
             self.history.reset(user_id)
             if self.history.reserve_control(user_id):
                 await self.reply(
@@ -355,7 +362,38 @@ class Userbot:
             return
         if command == "/ai_start":
             self.history.pause(user_id, False)
+            if tasks:
+                tasks.wakeup.set()
         elif self.history.is_paused(user_id):
+            return
+        task_command = task_control(text)
+        if task_command and tasks:
+            if not self.history.reserve_control(user_id):
+                return
+            action, task_id = task_command
+            try:
+                if action == "cancel":
+                    if task_id is None:
+                        active = [
+                            r
+                            for r in tasks.store.list(user_id)
+                            if r["status"] in {"В очереди", "Выполняется", "Нужно уточнение"}
+                        ]
+                        if len(active) != 1:
+                            await self.reply(
+                                event, "Укажи номер: «Отмени задачу 3».\n\n" + tasks.report(user_id)
+                            )
+                            return
+                        task_id = active[0]["id"]
+                    result = await tasks.cancel(user_id, task_id)
+                    await self.reply(
+                        event,
+                        f"Задача #{task_id}: {result['status']}. Уже отправленные результаты остаются в чате.",
+                    )
+                else:
+                    await self.reply(event, tasks.report(user_id, task_id))
+            except ValueError as exc:
+                await self.reply(event, str(exc))
             return
         is_control = command in {
             "/ai_start",
@@ -475,7 +513,18 @@ class Userbot:
                     epoch = self.history.epoch(user_id)
                     history, memory_notice = await self.memory.context(user_id, content)
                     model_messages = [*history, {"role": "user", "content": content}]
-                    if self.agent:
+                    background = background_request(text)
+                    if background and tasks:
+                        created = tasks.create(
+                            user_id,
+                            event.id,
+                            model_messages,
+                            title=background[:110],
+                            instruction=background,
+                            delay_minutes=0,
+                        )
+                        answer = f"Принял задачу #{created['task_id']}. Займусь ею в фоне и пришлю результат сюда. Можно продолжать переписку или спросить «Что сделано?»."
+                    elif self.agent:
                         answer = await self.agent.answer(
                             model_messages,
                             user_id,
@@ -521,9 +570,11 @@ class Userbot:
                         except (TTSError, MediaError) as exc:
                             LOG.warning("Озвучка не завершена: %s", exc)
                             await self.reply(event, simple_error(exc))
-            except (MediaError, ProviderError) as exc:
+            except (MediaError, ProviderError, ValueError) as exc:
                 LOG.warning("Запрос не завершён: %s", exc)
-                await self.reply(event, simple_error(exc))
+                await self.reply(
+                    event, str(exc) if isinstance(exc, ValueError) else simple_error(exc)
+                )
 
 
 async def run(settings):
@@ -541,6 +592,7 @@ async def run(settings):
     archiver = Archiver(archive, client)
     web_server = None
     web_task = None
+    task_manager = None
     try:
         await client.connect()
         if not await client.is_user_authorized():
@@ -592,6 +644,11 @@ async def run(settings):
             images,
             Agent(settings, provider, search, client),
         )
+        from .tasks import TaskManager
+
+        task_manager = TaskManager(settings, bot.agent, history)
+        bot.agent.tasks = task_manager
+        task_manager.start()
         if settings.enable_calls:
             from .calls import CallBridge, call_readiness
 
@@ -656,6 +713,8 @@ async def run(settings):
             await asyncio.gather(maintenance, return_exceptions=True)
         if calls:
             await calls.close()
+        if task_manager:
+            await task_manager.close()
         await client.disconnect()
         await archiver.close()
         archive.close()

@@ -3,6 +3,40 @@
 import re
 
 
+def background_request(text):
+    match = re.match(
+        r"^(?:пожалуйста[, ]+)?(?:в фоне|в фоновом режиме|сделай в фоне|выполни в фоне|фоновая задача)\s*[:—,-]?\s+(.+)$",
+        text.strip(),
+        re.I | re.S,
+    )
+    return match[1].strip() if match else None
+
+
+def task_control(text):
+    value = text.lower().strip(" .!?")
+    if value in {
+        "мои задачи",
+        "список задач",
+        "какие задачи выполняются",
+        "что сделано",
+        "что уже сделано",
+        "как продвигается",
+        "покажи задачи",
+        "статус задач",
+        "/tasks",
+    }:
+        return "list", None
+    match = re.fullmatch(
+        r"(?:что с задачей|статус задачи|покажи задачу|задача|/task)\s*#?\s*(\d+)", value
+    )
+    if match:
+        return "get", int(match[1])
+    match = re.fullmatch(r"(?:отмени|останови)\s+задачу(?:\s*#?\s*(\d+))?", value)
+    if match:
+        return "cancel", int(match[1]) if match[1] else None
+    return None
+
+
 def control_intent(text):
     normalized = text.strip().lower().strip(".!? ")
     normalized = re.sub(r"^пожалуйста[, ]+", "", normalized)
