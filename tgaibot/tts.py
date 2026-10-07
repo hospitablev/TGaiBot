@@ -1,6 +1,7 @@
 """Fish Audio TTS. The Claude key is never used by this client."""
 
 import asyncio
+import re
 
 import httpx
 
@@ -10,6 +11,37 @@ from .media import run_tool
 
 class TTSError(Exception):
     pass
+
+
+SPEECH_TAGS = (
+    "chuckle",
+    "chuckling",
+    "laughing",
+    "laughing tone",
+    "short pause",
+    "long pause",
+    "pause",
+    "sigh",
+    "inhale",
+    "exhale",
+    "whisper",
+    "whispering",
+    "soft tone",
+    "warm tone",
+    "excited",
+    "excited tone",
+    "sad",
+    "surprised",
+    "emphasis",
+    "calm",
+)
+TAG_PATTERN = re.compile(r"\[(?:" + "|".join(map(re.escape, SPEECH_TAGS)) + r")\](?!\()", re.I)
+
+
+def display_speech(text):
+    """Delivery directions belong in Fish input, never in the visible transcript."""
+    plain = re.sub(r"[ \t]{2,}", " ", TAG_PATTERN.sub("", text)).strip()
+    return re.sub(r"\n(?:[ \t]*\n){2,}", "\n\n", plain)
 
 
 def speech_text(text, limit=1500):

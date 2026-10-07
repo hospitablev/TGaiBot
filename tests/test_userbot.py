@@ -183,6 +183,44 @@ async def test_text_survives_tts_failure(bot):
     assert bot.history.messages(10)[-1]["content"] == "Ответ"
 
 
+async def test_agent_voice_is_not_automatically_synthesized_twice(bot, tmp_path):
+    from dataclasses import replace
+
+    from tgaibot.agent import Agent
+
+    bot.settings = replace(bot.settings, fish_key="fake-fish")
+    bot.client.send_file = AsyncMock()
+    bot.tts = SimpleNamespace(voice_note=AsyncMock(return_value=(tmp_path / "voice.ogg", False)))
+    bot.history.set_voice(10, True)
+    bot.provider.step = AsyncMock(
+        side_effect=[
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "v1",
+                        "type": "function",
+                        "function": {
+                            "name": "send_voice",
+                            "arguments": '{"text":"[chuckle] Привет, вот короткий стих"}',
+                        },
+                    }
+                ],
+            },
+            {"content": "Готово"},
+        ]
+    )
+    bot.agent = Agent(bot.settings, bot.provider, SimpleNamespace(), bot.client)
+    bot.agent.memory, bot.agent.tts = bot.memory, bot.tts
+    incoming = event("Можешь отвечать голосом и рассказать стих короткий")
+    await bot.handle(incoming)
+    bot.tts.voice_note.assert_awaited_once()
+    bot.client.send_file.assert_awaited_once()
+    assert "[chuckle]" not in incoming.reply.await_args.args[0]
+    assert bot.history.messages(10)[-1]["content"] == "Привет, вот короткий стих"
+
+
 async def test_image_sent_as_file_not_link(bot, tmp_path):
     from PIL import Image
 

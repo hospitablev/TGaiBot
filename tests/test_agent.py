@@ -60,10 +60,10 @@ async def test_unknown_tool_or_cross_chat_parameter_cannot_send(agent):
     agent.client.send_file.assert_not_awaited()
 
 
-async def test_memory_tool_scopes_search_to_requester(agent):
+async def test_memory_tool_scopes_search_to_requester(agent, history):
     from unittest.mock import Mock
 
-    agent.memory = SimpleNamespace(search=Mock(return_value={"facts": []}))
+    agent.memory = SimpleNamespace(search=Mock(return_value={"facts": []}), history=history)
     agent.provider.step.side_effect = [
         response(call("search_memory", {"query": "имя", "user_id": 99})),
         response(call("search_memory", {"query": "имя"}, "2")),

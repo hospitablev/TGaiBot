@@ -211,6 +211,7 @@ class Userbot:
         self.agent = agent
         if self.agent:
             self.agent.memory = self.memory
+            self.agent.tts = self.tts
 
     async def reply(self, event, text):
         for part, entities in formatted_chunks(text):
@@ -637,6 +638,8 @@ class Userbot:
                             user_id,
                             event.id,
                             lambda: self.history.epoch(user_id) == epoch,
+                            voice_default=self.settings.voice_replies == "always"
+                            or any(getattr(m, "voice", False) for m in messages),
                         )
                     else:
                         answer = await self.provider.answer(model_messages)
@@ -656,7 +659,12 @@ class Userbot:
                         self.settings.voice_replies == "always"
                         or any(getattr(m, "voice", False) for m in messages),
                     )
-                    if self.tts and wants_voice and self.settings.voice_replies != "off":
+                    if (
+                        self.tts
+                        and wants_voice
+                        and self.settings.voice_replies != "off"
+                        and not getattr(answer, "voice_attempted", False)
+                    ):
                         try:
                             voice, truncated = await self.tts.voice_note(answer, Path(temp))
                             if self.history.epoch(user_id) != epoch:

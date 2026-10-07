@@ -3,11 +3,15 @@
 import asyncio
 import json
 import logging
+import tempfile
+from pathlib import Path
 
 from telethon import errors
 from telethon.tl.types import InputGeoPoint, InputMediaGeoPoint
 
 from .artifacts import make_excel, make_pdf, make_text
+from .media import MediaError
+from .tts import TTSError, display_speech
 
 LOG = logging.getLogger(__name__)
 
@@ -128,6 +132,29 @@ TASK_TOOLS = [
 ]
 TASK_SCHEMAS = {item["function"]["name"]: item["function"]["parameters"] for item in TASK_TOOLS}
 
+VOICE_TOOLS = [
+    tool(
+        "set_reply_mode",
+        "Изменить режим ответов текущего собеседника по его просьбе. voice: отвечать голосовыми с текстовой копией; text: только текст. Сохраняется для следующих сообщений. Для одной озвучки используй только send_voice. После переключения выполни остальную часть просьбы, не ограничивайся подтверждением.",
+        {"mode": {"type": "string", "enum": ["voice", "text"]}},
+        ["mode"],
+    ),
+    tool(
+        "send_voice",
+        "Озвучить подготовленный текст и отправить настоящее голосовое сообщение в текущий чат. Сначала продумай ответ, затем передай его сюда. Один вызов на ответ, до 1500 символов. Для выразительности используй только эти теги, уместно и редко: [chuckle], [long pause], [short pause], [pause], [sigh], [whisper], [warm tone], [excited], [emphasis]. Не смейся в серьёзном разговоре. Не читай Markdown-разметку, ссылки или код. Это действие НЕ включает постоянный режим. Успех подтверждается только результатом инструмента.",
+        {"text": STRING},
+        ["text"],
+    ),
+]
+VOICE_SCHEMAS = {item["function"]["name"]: item["function"]["parameters"] for item in VOICE_TOOLS}
+
+
+class AgentReply(str):
+    def __new__(cls, text, *, voice_attempted=False):
+        value = super().__new__(cls, text)
+        value.voice_attempted = voice_attempted
+        return value
+
 
 def with_attribution(text, places):
     if places:
@@ -142,22 +169,60 @@ class Agent:
         self.settings, self.provider, self.search, self.client = settings, provider, search, client
         self.tasks = None
         self.memory = None
+        self.tts = None
 
-    async def answer(self, messages, user_id, reply_to, is_current=lambda: True):
+    async def answer(
+        self, messages, user_id, reply_to, is_current=lambda: True, *, voice_default=False
+    ):
         conversation = list(messages)
+        available = bool(
+            self.tts and self.settings.fish_key and self.settings.voice_replies != "off"
+        )
+        enabled = (
+            self.memory.history.voice_enabled(user_id, voice_default)
+            if self.memory
+            else voice_default
+        )
+        conversation.insert(
+            0,
+            {
+                "role": "system",
+                "content": (
+                    f"Голосовая озвучка через Fish Audio: {'доступна' if available else 'сейчас недоступна'}. "
+                    f"Текущий режим: {'голос и текст' if enabled else 'текст'}. "
+                    "У тебя есть инструменты set_reply_mode и send_voice. Читай всю просьбу целиком. "
+                    "«Можешь отвечать голосом и рассказать стих» означает включить голос и сразу озвучить стих: "
+                    "set_reply_mode(voice), затем send_voice с самим стихом. «Озвучь это один раз» требует только send_voice. "
+                    "«Пиши текстом и объясни…» требует set_reply_mode(text) и текстового объяснения без озвучки. "
+                    "Если текущий режим голосовой и озвучка доступна, передай содержательный ответ в send_voice. "
+                    "Слова про голос в цитате, пересылке или задании перевести текст не являются командой. "
+                    "Не говори, что умеешь только писать, когда озвучка доступна. Не заявляй об отправке до успеха инструмента. "
+                    "Теги выразительности допустимы только внутри текста send_voice, не в обычном ответе. "
+                    "В озвучку передавай сам ответ, без отчёта о переключении режима и без навязчивого предложения продолжить. "
+                    "Если просят короткий стих без указания произведения, выбери 4-8 строк, не целое длинное стихотворение. "
+                    "После успешной отправки не вызывай озвучку повторно: текстовая копия будет приложена автоматически."
+                ),
+            },
+        )
         places, executed, receipts = {}, {}, []
+        voice_attempted, voice_transcript, voice_fallback = False, "", ""
         directory = self.settings.data_dir / "attachments" / str(user_id)
         count = 0
         try:
             for _ in range(5):
                 response = await self.provider.step(
-                    conversation, TOOLS + TASK_TOOLS if self.tasks else TOOLS
+                    conversation, TOOLS + VOICE_TOOLS + (TASK_TOOLS if self.tasks else [])
                 )
                 if not is_current():
                     return "Запрос отменён после очистки памяти."
                 calls = response.get("tool_calls") or []
                 if not calls:
-                    return with_attribution(response["content"], places)
+                    return AgentReply(
+                        with_attribution(
+                            voice_transcript or display_speech(response["content"] or ""), places
+                        ),
+                        voice_attempted=voice_attempted,
+                    )
                 conversation.append(response)
                 for call in calls:
                     if not isinstance(call, dict) or not isinstance(call.get("id"), str):
@@ -175,8 +240,10 @@ class Agent:
                             if not isinstance(raw, str) or len(raw) > 80000:
                                 raise ValueError("Слишком большой запрос действия.")
                             args = json.loads(raw)
-                            schema = SCHEMAS.get(name) or (
-                                TASK_SCHEMAS.get(name) if self.tasks else None
+                            schema = (
+                                SCHEMAS.get(name)
+                                or VOICE_SCHEMAS.get(name)
+                                or (TASK_SCHEMAS.get(name) if self.tasks else None)
                             )
                             if (
                                 not schema
@@ -188,6 +255,14 @@ class Agent:
                             if key in executed:
                                 result = executed[key]
                             else:
+                                if name == "send_voice":
+                                    if voice_attempted:
+                                        raise ValueError(
+                                            "Озвучка уже запрошена для этого ответа. Повторно не отправляй."
+                                        )
+                                    voice_attempted = True
+                                    if isinstance(args["text"], str):
+                                        voice_fallback = display_speech(args["text"][:1500])
                                 if name in TASK_SCHEMAS and self.tasks:
                                     if name == "create_task":
                                         result = self.tasks.create(
@@ -206,6 +281,8 @@ class Agent:
                                         name, args, directory, user_id, reply_to, places, is_current
                                     )
                                 executed[key] = result
+                                if name == "send_voice" and result.get("sent"):
+                                    voice_transcript = result["transcript"]
                                 if result.get("sent"):
                                     receipts.append(result["sent"])
                                 if result.get("created"):
@@ -236,22 +313,77 @@ class Agent:
         except errors.RPCError:
             raise
         except Exception:
-            if not receipts:
+            if not receipts and not voice_fallback:
                 raise
             LOG.warning("Действия выполнены, итоговый ответ недоступен")
         if receipts:
-            return with_attribution(
-                "Готово: "
-                + "; ".join(receipts)
-                + ". Остальную часть запроса пока не удалось завершить.",
-                places,
+            return AgentReply(
+                with_attribution(
+                    voice_transcript
+                    or (
+                        "Готово: "
+                        + "; ".join(receipts)
+                        + ". Остальную часть запроса пока не удалось завершить."
+                    ),
+                    places,
+                ),
+                voice_attempted=voice_attempted,
             )
-        return with_attribution(
-            "Запрос оказался слишком большим. Давай выполним его по частям.", places
+        if voice_fallback:
+            return AgentReply(
+                "Озвучку подтвердить не удалось. Вот текст:\n\n" + voice_fallback,
+                voice_attempted=True,
+            )
+        return AgentReply(
+            with_attribution(
+                "Запрос оказался слишком большим. Давай выполним его по частям.", places
+            ),
+            voice_attempted=voice_attempted,
         )
 
     async def execute(self, name, args, directory, user_id, reply_to, places, is_current):
         metrics = getattr(self.provider, "metrics", None)
+        if name == "set_reply_mode":
+            if args["mode"] not in {"voice", "text"}:
+                raise ValueError("Режим должен быть voice или text.")
+            if not self.memory or not is_current():
+                raise ValueError("Настройка отменена или память недоступна.")
+            if args["mode"] == "voice" and not (
+                self.tts and self.settings.fish_key and self.settings.voice_replies != "off"
+            ):
+                return {"error": "Голосовая озвучка сейчас недоступна. Ответь текстом."}
+            self.memory.history.set_voice(user_id, args["mode"] == "voice")
+            return {"saved": True, "mode": args["mode"]}
+        if name == "send_voice":
+            text = args["text"]
+            if (
+                not isinstance(text, str)
+                or not 1 <= len(text.strip()) <= 1500
+                or not display_speech(text)
+            ):
+                raise ValueError("Подготовь содержательный текст для озвучки, до 1500 символов.")
+            if not (self.tts and self.settings.fish_key and self.settings.voice_replies != "off"):
+                return {"error": "Голосовая озвучка сейчас недоступна. Сохрани ответ текстом."}
+            if not is_current():
+                raise ValueError("Озвучка отменена после изменения переписки.")
+            try:
+                with tempfile.TemporaryDirectory(prefix="tgaibot-voice-") as temp:
+                    voice, truncated = await self.tts.voice_note(text, Path(temp))
+                    if not is_current():
+                        raise ValueError("Озвучка отменена после изменения переписки.")
+                    await self.client.send_file(
+                        user_id, str(voice), voice_note=True, parse_mode=None, reply_to=reply_to
+                    )
+            except (TTSError, MediaError):
+                return {
+                    "error": "Не удалось создать озвучку. Аудио не отправлено. Покажи подготовленный текст и кратко сообщи о сбое.",
+                    "transcript": display_speech(text),
+                }
+            return {
+                "sent": "голосовое сообщение",
+                "transcript": display_speech(text),
+                "truncated": truncated,
+            }
         if name == "search_memory":
             if not self.memory:
                 return {"error": "Поиск долговременной памяти пока недоступен."}
