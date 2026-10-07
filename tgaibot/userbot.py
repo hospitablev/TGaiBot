@@ -68,6 +68,9 @@ def chunks(text, limit=3500):
 
 
 class IncomingOnlyTelegramClient(TelegramClient):
+    # PyTgCalls 3.0 detects its adapter by class.__module__, not isinstance/MRO.
+    # Preserve Telethon's package marker while keeping our outbound RPC guard.
+    __module__ = TelegramClient.__module__
     archive_sink = None
 
     async def record_sent(self, result):

@@ -38,6 +38,17 @@ async def test_outbound_call_rpc_blocked_before_network():
         await client(request)
 
 
+async def test_real_pytgcalls_accepts_guarded_telethon_client_without_login():
+    sdk = pytest.importorskip("pytgcalls")
+    client = IncomingOnlyTelegramClient(None, 1, "0" * 32)
+    calls = sdk.PyTgCalls(client)
+    assert calls.mtproto_client is client
+    assert calls._app.package_name == "telethon"
+    assert calls._app._bind_client.__class__.__name__ == "TelethonClient"
+    calls.executor.shutdown(wait=False)
+    await client.disconnect()
+
+
 def test_calls_require_separate_enablement_and_allowlist(settings):
     missing = call_readiness(settings)
     assert "FISH_API_KEY" in missing
