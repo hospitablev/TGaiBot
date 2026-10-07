@@ -1,0 +1,8 @@
+*
+!Dockerfile
+!pyproject.toml
+!uv.lock
+!tgaibot/
+!tgaibot/**
+**/__pycache__/
+**/*.pyc
