@@ -44,6 +44,37 @@ async def test_file_sent_to_requester_once_even_when_model_repeats(agent):
     assert len(list((agent.settings.data_dir / "attachments" / "45").glob("*.txt"))) == 1
 
 
+async def test_real_photo_tool_sends_once_to_requester_with_reply_and_source(
+    agent, monkeypatch, tmp_path
+):
+    from tgaibot.metrics import Metrics
+
+    photo = {
+        "path": str(tmp_path / "photo.jpg"),
+        "source": "https://example.com/soup",
+        "title": "Soup",
+    }
+    monkeypatch.setattr("tgaibot.web_photos.find_photo", AsyncMock(return_value=photo))
+    action = call("send_web_photo", {"query": "해물된장찌개"})
+    agent.provider.step.side_effect = [
+        response(action),
+        response(action),
+        {"content": "Вот фото 🙂"},
+    ]
+    agent.provider.metrics = Metrics(tmp_path / "metrics")
+    try:
+        assert await agent.answer([], 45, 123) == "Вот фото 🙂"
+        agent.client.send_file.assert_awaited_once()
+        args = agent.client.send_file.await_args
+        assert args.args == (45, photo["path"]) and args.kwargs["reply_to"] == 123
+        assert not args.kwargs["force_document"] and photo["source"] in args.kwargs["caption"]
+        report = agent.provider.metrics.report()
+        assert "Фото из интернета отправлено: 1" in report
+        assert "Изображений сгенерировано: 0" in report
+    finally:
+        agent.provider.metrics.close()
+
+
 async def test_unknown_tool_or_cross_chat_parameter_cannot_send(agent):
     agent.provider.step.side_effect = [
         response(

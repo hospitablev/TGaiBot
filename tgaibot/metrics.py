@@ -197,6 +197,7 @@ class Metrics:
             f"Прочитано из кэша: {tokens('cached_tokens', 'cached_known')}\n"
             f"Записано в кэш: {tokens('written_tokens', 'written_known')}\n\n"
             f"Изображений сгенерировано: {count('image')}\n"
+            f"Фото из интернета отправлено: {count('web_photo')}\n"
             f"Озвучек создано: {count('voice')}\n"
             f"Файлов отправлено: {count('file')}\n"
             f"Геолокаций отправлено: {count('location')}\n"

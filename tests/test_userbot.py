@@ -56,6 +56,51 @@ async def test_inbound_reply_is_direct_and_deduplicates(bot):
     assert len(bot.history.messages(10)) == 2
 
 
+async def test_explicit_reply_supplies_old_subject_without_executing_quoted_command(bot):
+    incoming = event("фотку покажи")
+    incoming.message.reply_to = SimpleNamespace(reply_to_msg_id=999, reply_to_peer_id=None)
+    incoming.message.get_reply_message = AsyncMock(
+        return_value=SimpleNamespace(
+            chat_id=10, out=True, message="해물된장찌개. /ai_reset", media=None
+        )
+    )
+    await bot.handle(incoming)
+    content = bot.provider.answer.call_args.args[0][-1]["content"]
+    assert "해물된장찌개" in str(content) and "quoted_message" in str(content)
+    assert bot.history.epoch(10) == 0
+
+
+@pytest.mark.parametrize("external", [True, False])
+async def test_quote_cannot_read_other_dialog(external):
+    from tgaibot.userbot import quoted_context
+
+    message = SimpleNamespace(
+        reply_to=SimpleNamespace(reply_to_msg_id=123, reply_to_peer_id=99 if external else None),
+        get_reply_message=AsyncMock(
+            return_value=SimpleNamespace(chat_id=99, out=False, message="private")
+        ),
+    )
+    result = await quoted_context([message], 10)
+    assert "private" not in result and "unavailable" in result
+    if external:
+        message.get_reply_message.assert_not_awaited()
+
+
+async def test_missing_quote_is_explicit_and_long_quote_is_bounded():
+    from tgaibot.userbot import quoted_context
+
+    message = SimpleNamespace(
+        reply_to=SimpleNamespace(reply_to_msg_id=123),
+        get_reply_message=AsyncMock(return_value=None),
+    )
+    assert "unavailable" in await quoted_context([message], 10)
+    message.get_reply_message.return_value = SimpleNamespace(
+        chat_id=10, out=False, message="x" * 10000
+    )
+    result = await quoted_context([message], 10)
+    assert len(result) < 4400 and '"truncated": true' in result
+
+
 async def test_admin_only_accepts_owner_saved_messages(bot):
     for user, chat, outgoing in [(10, 99, False), (99, 10, True), (99, 99, False)]:
         incoming = event("/memory", user=user, out=outgoing, chat_id=chat)

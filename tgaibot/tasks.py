@@ -26,6 +26,7 @@ LABELS = {
 }
 ACTION_LABELS = {
     "search_web": "Поиск в интернете",
+    "send_web_photo": "Поиск и отправка фотографии",
     "search_places": "Поиск на карте",
     "send_location": "Отправка геолокации",
     "create_pdf": "Создание PDF",

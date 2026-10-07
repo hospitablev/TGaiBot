@@ -26,6 +26,18 @@ class Search:
     async def close(self):
         await self.client.aclose()
 
+    async def images(self, query):
+        bounded_text(query, 400)
+        rows = await asyncio.to_thread(
+            lambda: DDGS(timeout=12).images(
+                query, max_results=6, backend="bing,duckduckgo", safesearch="moderate"
+            )
+        )
+        return [
+            {key: str(row.get(key) or "")[:2000] for key in ("title", "url", "image", "thumbnail")}
+            for row in rows[:6]
+        ]
+
     async def web(self, query):
         bounded_text(query, 400)
         if self.settings.tavily_key:
